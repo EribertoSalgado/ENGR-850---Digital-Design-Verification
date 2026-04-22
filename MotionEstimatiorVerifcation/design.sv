@@ -1,271 +1,356 @@
+`timescale 1ns/1ps
 
 /* Module For Top Level Hierarchy */
-module top (clock, start, BestDist, motionX, motionY, AddressR, AddressS1, AddressS2, R, S1, S2, completed);
-	input clock;
-	input start;
-	output [7:0] BestDist;
-	output [3:0] motionX, motionY;
-	output completed;
+module top (
+  input  wire        clock,
+  input  wire        start,
+  output wire [7:0]  BestDist,
+  output wire [3:0]  motionX,
+  output wire [3:0]  motionY,
+  output wire [7:0]  AddressR,
+  output wire [9:0]  AddressS1,
+  output wire [9:0]  AddressS2,
+  input  wire [7:0]  R,
+  input  wire [7:0]  S1,
+  input  wire [7:0]  S2,
+  output wire        completed
+);
 
-	wire clock;
-	wire start;
-	wire [7:0] BestDist;
-	wire [3:0] motionX, motionY;
+  wire [15:0] S1S2mux, newDist, PEready;
+  wire        CompStart;
+  wire [3:0]  VectorX, VectorY;
+  wire [127:0] Accumulate;
 
-	input [7:0] R, S1, S2;
-	output [7:0] AddressR;
-	output [9:0] AddressS1, AddressS2;
+  // Delay comparator-side control by 1 cycle so it aligns with registered PE outputs
+  reg  [15:0] PEready_d;
+  reg         CompStart_d;
+  reg  [3:0]  VectorX_d, VectorY_d;
 
-	wire [15:0] S1S2mux, newDist, PEready;
-	wire CompStart;
-	wire [3:0] VectorX, VectorY;
-	wire [127:0] Accumulate;
-	wire [7:0] Rpipe;
+  control ctl_u (
+    .clock(clock),
+    .start(start),
+    .S1S2mux(S1S2mux),
+    .newDist(newDist),
+    .CompStart(CompStart),
+    .PEready(PEready),
+    .VectorX(VectorX),
+    .VectorY(VectorY),
+    .AddressR(AddressR),
+    .AddressS1(AddressS1),
+    .AddressS2(AddressS2),
+    .completed(completed)
+  );
 
-	control ctl_u(clock, start, S1S2mux, newDist, CompStart, PEready, VectorX, VectorY, AddressR, AddressS1, AddressS2, completed);
+  PEtotal pe_u (
+    .clock(clock),
+    .R(R),
+    .S1(S1),
+    .S2(S2),
+    .S1S2mux(S1S2mux),
+    .newDist(newDist),
+    .Accumulate(Accumulate)
+  );
 
-	PEtotal pe_u(clock, R, S1, S2, S1S2mux, newDist, Accumulate);
+  always @(posedge clock) begin
+    PEready_d   <= PEready;
+    CompStart_d <= CompStart;
+    VectorX_d   <= VectorX;
+    VectorY_d   <= VectorY;
+  end
 
-	Comparator comp_u(clock, CompStart, Accumulate, PEready, VectorX, VectorY, BestDist, motionX, motionY);
+  Comparator comp_u (
+    .clock(clock),
+    .CompStart(CompStart_d),
+    .PEout(Accumulate),
+    .PEready(PEready_d),
+    .vectorX(VectorX_d),
+    .vectorY(VectorY_d),
+    .BestDist(BestDist),
+    .motionX(motionX),
+    .motionY(motionY)
+  );
+
 endmodule
+
 
 /* Module For Processing Element (PE) */
-module PE (clock, R, S1, S2, S1S2mux, newDist, Accumulate, Rpipe);
-	input clock;
-	input [7:0] R, S1, S2; // memory inputs
-	input S1S2mux, newDist; // control input
-	output [7:0] Accumulate, Rpipe;
-	reg [7:0] Accumulate, AccumulateIn, difference, difference_temp, Rpipe;
-	reg Carry;
+module PE (
+  input  wire       clock,
+  input  wire [7:0] R,
+  input  wire [7:0] S1,
+  input  wire [7:0] S2,
+  input  wire       S1S2mux,
+  input  wire       newDist,
+  output reg  [7:0] Accumulate,
+  output reg  [7:0] Rpipe
+);
 
-	always @(posedge clock) Rpipe <= R;
-	always @(posedge clock) Accumulate <= AccumulateIn;
+  reg  [7:0] AccumulateIn;
+  reg  [7:0] pixel_sel;
+  reg  [7:0] difference;
+  reg        Carry;
 
-	always @(R or S1 or S2 or S1S2mux or newDist or Accumulate)
-	    begin 
-		difference = R -(S1S2mux? S1:S2);
-		difference_temp = - difference;
-		if (difference<0) 
-		 begin
-			 difference = difference_temp;  
-		 end
-		{Carry,AccumulateIn} = Accumulate + difference;
-		if (Carry == 1) AccumulateIn = 8'hFF; // saturated
-		if (newDist == 1) AccumulateIn = difference;
-	    end
+  always @(posedge clock) begin
+    Rpipe      <= R;
+    Accumulate <= AccumulateIn;
+  end
+
+  always @(*) begin
+    pixel_sel = (S1S2mux ? S1 : S2);
+
+    if (R >= pixel_sel)
+      difference = R - pixel_sel;
+    else
+      difference = pixel_sel - R;
+
+    {Carry, AccumulateIn} = Accumulate + difference;
+
+    if (Carry)
+      AccumulateIn = 8'hFF; // saturated
+
+    if (newDist)
+      AccumulateIn = difference;
+  end
+
 endmodule
+
 
 /* Module For The Last Processing Element (PEend) */
-module PEend (clock, R, S1, S2, S1S2mux, newDist, Accumulate);
-	input clock;
-	input [7:0] R, S1, S2; // memory inputs
-	input S1S2mux, newDist; // control input
-	output [7:0] Accumulate;
-	reg [7:0] Accumulate, AccumulateIn, difference, difference_temp;
-	reg Carry;
+module PEend (
+  input  wire       clock,
+  input  wire [7:0] R,
+  input  wire [7:0] S1,
+  input  wire [7:0] S2,
+  input  wire       S1S2mux,
+  input  wire       newDist,
+  output reg  [7:0] Accumulate
+);
 
-	always @(posedge clock) Accumulate <= AccumulateIn;
+  reg  [7:0] AccumulateIn;
+  reg  [7:0] pixel_sel;
+  reg  [7:0] difference;
+  reg        Carry;
 
-	always @(R or S1 or S2 or S1S2mux or newDist or Accumulate)
-	    begin 
-		difference = R -(S1S2mux? S1:S2);
-		difference_temp = - difference;
-		if (difference<0) 
-		 begin
-			 difference = difference_temp;  
-		 end
-		{Carry,AccumulateIn} = Accumulate + difference;
-		if (Carry == 1) AccumulateIn = 8'hFF; // saturated
-		if (newDist == 1) AccumulateIn = difference;
-	    end
+  always @(posedge clock) begin
+    Accumulate <= AccumulateIn;
+  end
+
+  always @(*) begin
+    pixel_sel = (S1S2mux ? S1 : S2);
+
+    if (R >= pixel_sel)
+      difference = R - pixel_sel;
+    else
+      difference = pixel_sel - R;
+
+    {Carry, AccumulateIn} = Accumulate + difference;
+
+    if (Carry)
+      AccumulateIn = 8'hFF; // saturated
+
+    if (newDist)
+      AccumulateIn = difference;
+  end
+
 endmodule
+
 
 /* Module For Control Unit */
-module control (clock, start, S1S2mux, newDist, CompStart, PEready, VectorX, VectorY, AddressR, AddressS1, AddressS2, completed);
-	input clock;
-	input start; // = 1 when going
-	output [15:0] S1S2mux, newDist, PEready;
-	output CompStart;
-	output [3:0] VectorX, VectorY;
-	output [7:0] AddressR;
-	output [9:0] AddressS1, AddressS2;
-	output reg completed;
+module control (
+  input  wire        clock,
+  input  wire        start,
+  output reg  [15:0] S1S2mux,
+  output reg  [15:0] newDist,
+  output reg         CompStart,
+  output reg  [15:0] PEready,
+  output reg  [3:0]  VectorX,
+  output reg  [3:0]  VectorY,
+  output reg  [7:0]  AddressR,
+  output reg  [9:0]  AddressS1,
+  output reg  [9:0]  AddressS2,
+  output reg         completed
+);
 
-	parameter count_complete = 16*(16*16) + 15; //4111
+  parameter count_complete = 16*(16*16) + 15; // 4111
 
-	reg [15:0] S1S2mux, newDist, PEready;
-	reg CompStart;
-	reg [3:0] VectorX, VectorY;
-	reg [7:0] AddressR;
-	reg [9:0] AddressS1, AddressS2;
-	reg  [12:0] count, count_temp;
-	integer i;
+  reg [12:0] count, count_temp;
+  reg [11:0] temp;
+  integer i;
 
-	reg [11:0]  temp;
-	always @ (posedge clock)
-	  begin
-		  if (start == 0) count <= 12'b0;
-		  else if (completed == 0) count <= count_temp;
-	  end
-	  
-	always @ (count)
-	    begin
-	      count_temp = count + 1'b1;
-	      for (i=0; i<16; i= i+1)
-		begin
-		   newDist[i] = (count[7:0] == i);	
-		   PEready[i] = (newDist[i] && !(count < 256));	
-		   S1S2mux[i] = (count[3:0] >= i);
-		   CompStart  = (!(count < 256));
-		end
+  always @(posedge clock) begin
+    if (start == 1'b0)
+      count <= 13'b0;
+    else if (completed == 1'b0)
+      count <= count_temp;
+  end
 
-		AddressR = count[7:0];
-		AddressS1 = (count[11:8] + count[7:4])*32 + count[3:0];
+  always @(*) begin
+    count_temp = count + 13'b1;
 
-		temp = count[11:0]-16;
-		AddressS2 = (temp[11:8] + temp[7:4])*32 + temp[3:0] + 16;
+    for (i = 0; i < 16; i = i + 1) begin
+      newDist[i] = (count[7:0] == i[7:0]);
+      PEready[i] = (newDist[i] && !(count < 13'd256));
+      S1S2mux[i] = (count[3:0] >= i[3:0]);
+    end
 
-		VectorX = count[3:0] - 8; 
-		VectorY = count[11:8] - 9;
+    CompStart = !(count < 13'd256);
 
-		completed = (count[12:0] == count_complete); //4111
-	    end
+    AddressR  = count[7:0];
+    AddressS1 = (count[11:8] + count[7:4]) * 32 + count[3:0];
+
+    temp      = count[11:0] - 12'd16;
+    AddressS2 = (temp[11:8] + temp[7:4]) * 32 + temp[3:0] + 10'd16;
+
+    VectorX   = count[3:0] - 4'd8;
+    VectorY   = count[11:8] - 4'd9;
+
+    completed = (count == count_complete[12:0]);
+  end
+
 endmodule
+
 
 /* Module For Comparator Unit */
-module Comparator (clock, CompStart, PEout, PEready, vectorX, vectorY, BestDist, motionX, motionY);
-	input clock;
-	input CompStart; // goes high when distortion calculation start
-	input [8*16-1:0] PEout; // outputs of PEs as one long vector
-	input [15:0] PEready; // goes high when that PE has a new distortion
-	input [3:0] vectorX, vectorY; // motion vector being evaluated
-	output [7:0] BestDist; // best distortion vector so far
-	output [3:0] motionX, motionY; // best motion vector so far
-	reg [7:0] BestDist, newDist;
-	reg [3:0] motionX, motionY;
-	reg newBest;
-	integer n;
+module Comparator (
+  input  wire         clock,
+  input  wire         CompStart,
+  input  wire [8*16-1:0] PEout,
+  input  wire [15:0]  PEready,
+  input  wire [3:0]   vectorX,
+  input  wire [3:0]   vectorY,
+  output reg  [7:0]   BestDist,
+  output reg  [3:0]   motionX,
+  output reg  [3:0]   motionY
+);
 
-	always @ (posedge clock)
-	  if (CompStart == 0) BestDist <= 8'hFF; // initialize to highest value
-	  else if (newBest == 1)
-	    begin
-	      BestDist <= newDist;
-	      motionX <= vectorX;
-	      motionY <= vectorY;
-	    end
+  reg [7:0] newDist;
+  reg       newBest;
+  integer   n;
 
-	always @ (BestDist or PEout or PEready or CompStart)
-	  begin
-	    newDist = 8'hFF;
-	   
-	    for (n = 0; n <= 15; n = n+1)
-		begin
-		      if (PEready[n] == 1) 
-			case (n) 
-			  4'b0000: newDist = PEout[7:0];
-			  4'b0001: newDist = PEout[15:8]; 
-			  4'b0010: newDist = PEout[23:16]; 
-			  4'b0011: newDist = PEout[31:24];
-			  4'b0100: newDist = PEout[39:32]; 
-			  4'b0101: newDist = PEout[47:40]; 
-			  4'b0110: newDist = PEout[55:48]; 
-			  4'b0111: newDist = PEout[63:56]; 
-			  4'b1000: newDist = PEout[71:64]; 
-			  4'b1001: newDist = PEout[79:72]; 
-			  4'b1010: newDist = PEout[87:80]; 
-			  4'b1011: newDist = PEout[95:88]; 
-			  4'b1100: newDist = PEout[103:96]; 
-			  4'b1101: newDist = PEout[111:104]; 
-			  4'b1110: newDist = PEout[119:112]; 
-			  4'b1111: newDist = PEout[127:120];
-			  default: newDist = 8'hFF;  
-			endcase
-	     end
+  always @(posedge clock) begin
+    if (CompStart == 1'b0) begin
+      BestDist <= 8'hFF;
+      motionX  <= 4'd0;
+      motionY  <= 4'd0;
+    end
+    else if (newBest == 1'b1) begin
+      BestDist <= newDist;
+      motionX  <= vectorX;
+      motionY  <= vectorY;
+    end
+  end
 
-	    if ((|PEready == 0) || (CompStart == 0)) newBest = 0; // no PE is ready
-	    else if (newDist < BestDist) newBest = 1;
-	    else newBest = 0;
-	  end
+  always @(*) begin
+    newDist = 8'hFF;
+
+    for (n = 0; n <= 15; n = n + 1) begin
+      if (PEready[n]) begin
+        case (n)
+          0  : newDist = PEout[7:0];
+          1  : newDist = PEout[15:8];
+          2  : newDist = PEout[23:16];
+          3  : newDist = PEout[31:24];
+          4  : newDist = PEout[39:32];
+          5  : newDist = PEout[47:40];
+          6  : newDist = PEout[55:48];
+          7  : newDist = PEout[63:56];
+          8  : newDist = PEout[71:64];
+          9  : newDist = PEout[79:72];
+          10 : newDist = PEout[87:80];
+          11 : newDist = PEout[95:88];
+          12 : newDist = PEout[103:96];
+          13 : newDist = PEout[111:104];
+          14 : newDist = PEout[119:112];
+          15 : newDist = PEout[127:120];
+          default: newDist = 8'hFF;
+        endcase
+      end
+    end
+
+    if ((|PEready == 1'b0) || (CompStart == 1'b0))
+      newBest = 1'b0;
+    else if (newDist < BestDist)
+      newBest = 1'b1;
+    else
+      newBest = 1'b0;
+  end
+
 endmodule
 
-/* Module For Total 16 Processing Elements (PEtotal)*/
-module PEtotal (clock, R, S1, S2, S1S2mux, newDist, Accumulate);
-	input clock;
-	input [7:0] R, S1, S2; // memory inputs
-	input [15:0] S1S2mux, newDist; // control input
-	output [127:0] Accumulate;
 
-	wire [7:0] Rpipe0, Rpipe1, Rpipe2, Rpipe3, Rpipe4, Rpipe5, Rpipe6, Rpipe7, Rpipe8, Rpipe9, Rpipe10, Rpipe11, Rpipe12, Rpipe13, Rpipe14;
+/* Module For Total 16 Processing Elements (PEtotal) */
+module PEtotal (
+  input  wire         clock,
+  input  wire [7:0]   R,
+  input  wire [7:0]   S1,
+  input  wire [7:0]   S2,
+  input  wire [15:0]  S1S2mux,
+  input  wire [15:0]  newDist,
+  output wire [127:0] Accumulate
+);
 
-	PE pe0 (clock, R, S1, S2, S1S2mux[0], newDist[0], Accumulate[7:0], Rpipe0);
+  wire [7:0] Rpipe0, Rpipe1, Rpipe2, Rpipe3, Rpipe4, Rpipe5, Rpipe6, Rpipe7;
+  wire [7:0] Rpipe8, Rpipe9, Rpipe10, Rpipe11, Rpipe12, Rpipe13, Rpipe14;
 
-	PE pe1 (clock, Rpipe0, S1, S2, S1S2mux[1], newDist[1], Accumulate[15:8], Rpipe1);
+  PE pe0   (clock, R,       S1, S2, S1S2mux[0],  newDist[0],  Accumulate[7:0],    Rpipe0);
+  PE pe1   (clock, Rpipe0,  S1, S2, S1S2mux[1],  newDist[1],  Accumulate[15:8],   Rpipe1);
+  PE pe2   (clock, Rpipe1,  S1, S2, S1S2mux[2],  newDist[2],  Accumulate[23:16],  Rpipe2);
+  PE pe3   (clock, Rpipe2,  S1, S2, S1S2mux[3],  newDist[3],  Accumulate[31:24],  Rpipe3);
+  PE pe4   (clock, Rpipe3,  S1, S2, S1S2mux[4],  newDist[4],  Accumulate[39:32],  Rpipe4);
+  PE pe5   (clock, Rpipe4,  S1, S2, S1S2mux[5],  newDist[5],  Accumulate[47:40],  Rpipe5);
+  PE pe6   (clock, Rpipe5,  S1, S2, S1S2mux[6],  newDist[6],  Accumulate[55:48],  Rpipe6);
+  PE pe7   (clock, Rpipe6,  S1, S2, S1S2mux[7],  newDist[7],  Accumulate[63:56],  Rpipe7);
+  PE pe8   (clock, Rpipe7,  S1, S2, S1S2mux[8],  newDist[8],  Accumulate[71:64],  Rpipe8);
+  PE pe9   (clock, Rpipe8,  S1, S2, S1S2mux[9],  newDist[9],  Accumulate[79:72],  Rpipe9);
+  PE pe10  (clock, Rpipe9,  S1, S2, S1S2mux[10], newDist[10], Accumulate[87:80],  Rpipe10);
+  PE pe11  (clock, Rpipe10, S1, S2, S1S2mux[11], newDist[11], Accumulate[95:88],  Rpipe11);
+  PE pe12  (clock, Rpipe11, S1, S2, S1S2mux[12], newDist[12], Accumulate[103:96], Rpipe12);
+  PE pe13  (clock, Rpipe12, S1, S2, S1S2mux[13], newDist[13], Accumulate[111:104], Rpipe13);
+  PE pe14  (clock, Rpipe13, S1, S2, S1S2mux[14], newDist[14], Accumulate[119:112], Rpipe14);
 
-	PE pe2 (clock, Rpipe1, S1, S2, S1S2mux[2], newDist[2], Accumulate[23:16], Rpipe2);
+  PEend pe15 (
+    .clock(clock),
+    .R(Rpipe14),
+    .S1(S1),
+    .S2(S2),
+    .S1S2mux(S1S2mux[15]),
+    .newDist(newDist[15]),
+    .Accumulate(Accumulate[127:120])
+  );
 
-	PE pe3 (clock, Rpipe2, S1, S2, S1S2mux[3], newDist[3], Accumulate[31:24], Rpipe3);
-
-	PE pe4 (clock, Rpipe3, S1, S2, S1S2mux[4], newDist[4], Accumulate[39:32], Rpipe4);
-
-	PE pe5 (clock, Rpipe4, S1, S2, S1S2mux[5], newDist[5], Accumulate[47:40], Rpipe5);
-
-	PE pe6 (clock, Rpipe5, S1, S2, S1S2mux[6], newDist[6], Accumulate[55:48], Rpipe6);
-
-	PE pe7 (clock, Rpipe6, S1, S2, S1S2mux[7], newDist[7], Accumulate[63:56], Rpipe7);
-
-	PE pe8 (clock, Rpipe7, S1, S2, S1S2mux[8], newDist[8], Accumulate[71:64], Rpipe8);
-
-	PE pe9 (clock, Rpipe8, S1, S2, S1S2mux[9], newDist[9], Accumulate[79:72], Rpipe9);
-
-	PE pe10 (clock, Rpipe9, S1, S2, S1S2mux[10], newDist[10], Accumulate[87:80], Rpipe10);
-
-	PE pe11 (clock, Rpipe10, S1, S2, S1S2mux[11], newDist[11], Accumulate[95:88], Rpipe11);
-
-	PE pe12 (clock, Rpipe11, S1, S2, S1S2mux[12], newDist[12], Accumulate[103:96], Rpipe12);
-
-	PE pe13 (clock, Rpipe12, S1, S2, S1S2mux[13], newDist[13], Accumulate[111:104], Rpipe13);
-
-	PE pe14 (clock, Rpipe13, S1, S2, S1S2mux[14], newDist[14], Accumulate[119:112], Rpipe14);
-
-	PEend pe15 (clock, Rpipe14, S1, S2, S1S2mux[15], newDist[15], Accumulate[127:120]);
 endmodule
 
 
 /* Module For Reference Block (Memory) */
-module ROM_R (clock, AddressR, R);
-	input clock;
-	input [7:0] AddressR;
-	output [7:0] R;
-	
-	reg [7:0] R;
-	reg [7:0] Rmem[0:255];
-    
+module ROM_R (
+  input  wire       clock,
+  input  wire [7:0] AddressR,
+  output reg  [7:0] R
+);
 
-	//always @(posedge clock) R <= Rmem[AddressR];
-	always @(*) R = Rmem[AddressR];
+  reg [7:0] Rmem[0:255];
+
+  always @(*) begin
+    R = Rmem[AddressR];
+  end
 
 endmodule
 
+
 /* Module For Search Block (Memory) */
-module ROM_S (clock, AddressS1, AddressS2, S1, S2);
-	input clock;
-	input	[9:0]	AddressS1, AddressS2;
-	output	[7:0]	S1, S2;
+module ROM_S (
+  input  wire        clock,
+  input  wire [9:0]  AddressS1,
+  input  wire [9:0]  AddressS2,
+  output reg  [7:0]  S1,
+  output reg  [7:0]  S2
+);
 
-	reg	[7:0]	S1, S2;
-	reg	[7:0]	Smem[0:1023];
-        
-	/*always @(posedge clock) 
-	 begin
-		S1 <= Smem[AddressS1];
-		S2 <= Smem[AddressS2];
-	 end*/
+  reg [7:0] Smem[0:1023];
 
-	always @(*) 
-	 begin
-		S1 = Smem[AddressS1];
-		S2 = Smem[AddressS2];
-	 end
+  always @(*) begin
+    S1 = Smem[AddressS1];
+    S2 = Smem[AddressS2];
+  end
 
 endmodule
