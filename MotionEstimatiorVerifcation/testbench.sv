@@ -148,9 +148,9 @@ module top_testbench;
     clock = 0;
     start = 0;
 
-    test_mode = 0;
+    //test_mode = 0;
     //test_mode = 1;
-    //test_mode = 2;
+    test_mode = 2;
 
     // Search comes from file
     $readmemh("search.txt", memS_u.Smem);
