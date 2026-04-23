@@ -16,10 +16,6 @@ module top_testbench;
   integer signed x, y;
   integer test_mode;
 
-  // 0 = perfect using files as-is
-  // 1 = partial by perturbing reference after file load
-  // 2 = no-intended-match by replacing reference with random data
-
   top dut (
     .clock(clock),
     .start(start),
@@ -51,17 +47,43 @@ module top_testbench;
 
   always #10 clock = ~clock;
 
+  task make_ref_from_search;
+    input integer top_row;   // valid range: 0..16
+    input integer left_col;  // valid range: 0..16
+    integer r, c;
+    integer s_idx, r_idx;
+    begin
+      if (top_row < 0 || top_row > 16 || left_col < 0 || left_col > 16) begin
+        $display("ERROR: make_ref_from_search out of range. top_row=%0d left_col=%0d",
+                 top_row, left_col);
+        $finish;
+      end
+
+      for (r = 0; r < 16; r = r + 1) begin
+        for (c = 0; c < 16; c = c + 1) begin
+          s_idx = (top_row + r) * 32 + (left_col + c);
+          r_idx = r * 16 + c;
+          memR_u.Rmem[r_idx] = memS_u.Smem[s_idx];
+        end
+      end
+
+      $display("Reference copied from Search block: top_row=%0d left_col=%0d",
+               top_row, left_col);
+    end
+  endtask
+
   task apply_test_mode;
     begin
       case (test_mode)
         0: begin
-          $display("Running PERFECT MATCH test from files.");
+          $display("Running PERFECT MATCH test from search memory.");
+          make_ref_from_search(8, 7);   // example valid block
         end
 
         1: begin
           $display("Running PARTIAL / PERTURBED MATCH test.");
+          make_ref_from_search(8, 7);
 
-          // perturbations
           memR_u.Rmem[1]   = memR_u.Rmem[1]   + 8'd1;
           memR_u.Rmem[20]  = memR_u.Rmem[20]  + 8'd2;
           memR_u.Rmem[55]  = memR_u.Rmem[55]  + 8'd1;
@@ -77,6 +99,7 @@ module top_testbench;
 
         default: begin
           $display("Unknown test_mode. Using perfect match.");
+          make_ref_from_search(8, 7);
         end
       endcase
     end
@@ -125,20 +148,20 @@ module top_testbench;
     clock = 0;
     start = 0;
 
-    // choose one
     test_mode = 0;
     //test_mode = 1;
     //test_mode = 2;
 
-    $readmemh("ref.txt", memR_u.Rmem);
+    // Search comes from file
     $readmemh("search.txt", memS_u.Smem);
+
+    // Ref file can still be loaded, but may be overwritten by test mode
+    $readmemh("ref.txt", memR_u.Rmem);
 
     apply_test_mode();
 
-    // print memories after loading/modification
     print_memories();
 
-    // dump after modification
     $writememh("search_dump.txt", memS_u.Smem);
     $writememh("ref_randomized.txt", memR_u.Rmem);
 
