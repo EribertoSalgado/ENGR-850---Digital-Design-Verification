@@ -108,33 +108,43 @@ module top_testbench;
   // ---------------------------------------------------------------
   // Select test behavior
   // 0 = perfect match
-  // 1 = slightly modified match
-  // 2 = completely random reference
+  // 1 = partial / perturbed match
+  // 2 = max-distortion test
   // ---------------------------------------------------------------
   task apply_test_mode;
     begin
       case (test_mode)
         0: begin
           $display("Running PERFECT MATCH test from search memory.");
-          make_ref_from_search(8, 7);   // pick a valid block (row,column)
+          make_ref_from_search(8, 7);
         end
 
         1: begin
           $display("Running PARTIAL / PERTURBED MATCH test.");
           make_ref_from_search(8, 7);
 
-          // introduce small changes to a few pixels
-          memR_u.Rmem[1]   = memR_u.Rmem[1]   + 8'd1;
-          memR_u.Rmem[20]  = memR_u.Rmem[20]  + 8'd2;
-          memR_u.Rmem[55]  = memR_u.Rmem[55]  + 8'd1;
-          memR_u.Rmem[100] = memR_u.Rmem[100] + 8'd3;
+          // Make the perturbation clearly visible to the DUT
+          memR_u.Rmem[1]   = 8'h20;
+          memR_u.Rmem[20]  = 8'h40;
+          memR_u.Rmem[55]  = 8'h60;
+          memR_u.Rmem[100] = 8'h80;
+
+          $display("Perturbed pixels:");
+          $display("Rmem[1]   = %02h", memR_u.Rmem[1]);
+          $display("Rmem[20]  = %02h", memR_u.Rmem[20]);
+          $display("Rmem[55]  = %02h", memR_u.Rmem[55]);
+          $display("Rmem[100] = %02h", memR_u.Rmem[100]);
         end
 
         2: begin
-          $display("Running NO-INTENDED-MATCH test.");
-          // fill reference memory with random values
+          $display("Running MAX-DISTORTION test (Ref = FF, Search = 00).");
+
           foreach (memR_u.Rmem[i]) begin
-            memR_u.Rmem[i] = $urandom_range(0,255);
+            memR_u.Rmem[i] = 8'hFF;
+          end
+
+          foreach (memS_u.Smem[i]) begin
+            memS_u.Smem[i] = 8'h00;
           end
         end
 
@@ -177,75 +187,49 @@ module top_testbench;
   // Main simulation flow
   // ---------------------------------------------------------------
   initial begin
-    // waveform dump for GTKWave
     $dumpfile("dump.vcd");
-    $dumpvars(0, mif.clock);
-    $dumpvars(0, mif.start);
-    $dumpvars(0, mif.BestDist);
-    $dumpvars(0, mif.motionX);
-    $dumpvars(0, mif.motionY);
-    $dumpvars(0, mif.completed);
-    $dumpvars(0, mif.AddressR);
-    $dumpvars(0, mif.AddressS1);
-    $dumpvars(0, mif.AddressS2);
-    $dumpvars(0, mif.R);
-    $dumpvars(0, mif.S1);
-    $dumpvars(0, mif.S2);
-    $dumpvars(0, dut.ctl_u.count); // internal counter (useful for debug)
+    $dumpvars(0, top_testbench);
 
-    // initialize signals
     mif.clock = 0;
     mif.start = 0;
 
-    // choose test case here
     //test_mode = 0;
-    //test_mode = 1;
-    test_mode = 2;
+    test_mode = 1;
+    //test_mode = 2;
 
-    // load memory contents from files
     $readmemh("search.txt", memS_u.Smem);
     $readmemh("ref.txt", memR_u.Rmem);
 
-    // apply selected test mode (may overwrite ref memory)
     apply_test_mode();
-
-    // print contents to console
     print_memories();
 
-    // dump memories to files for inspection
     $writememh("search_dump.txt", memS_u.Smem);
     $writememh("ref_randomized.txt", memR_u.Rmem);
 
     $display("Starting simulation...");
 
-    // wait one clock, then assert start
     @(posedge mif.clock);
     #1 mif.start = 1'b1;
 
-    // run simulation loop
     for (i = 0; i < 5000; i = i + 1) begin
       @(posedge mif.clock);
       #1;
 
-      // print status every 100 cycles
       if ((i % 100) == 0) begin
         $display("cycle=%0d BestDist=%h motionX=%h motionY=%h count=%0d completed=%b",
                  i, mif.BestDist, mif.motionX, mif.motionY, dut.ctl_u.count, mif.completed);
       end
 
-      // stop when DUT finishes
       if (mif.completed) begin
         $display("Completed at cycle %0d", i);
         mif.start = 1'b0;
 
-        // convert 4-bit values to signed (-8 to +7)
         if (mif.motionX >= 8) x = mif.motionX - 16;
         else                  x = mif.motionX;
 
         if (mif.motionY >= 8) y = mif.motionY - 16;
         else                  y = mif.motionY;
 
-        // print final results
         $display("");
         $display("===== FINAL RESULT =====");
         $display("BestDist = %0d (0x%0h)", mif.BestDist, mif.BestDist);
@@ -254,7 +238,6 @@ module top_testbench;
         $display("completed = %b", mif.completed);
         $display("========================");
 
-        // simple pass/fail checks
         case (test_mode)
           0: begin
             if (mif.BestDist == 8'h00)
@@ -272,9 +255,9 @@ module top_testbench;
 
           2: begin
             if (mif.BestDist != 8'h00)
-              $display("PASS: no-intended-match test produced non-zero distortion.");
+              $display("PASS: max-distortion test produced non-zero distortion.");
             else
-              $display("FAIL: no-intended-match test unexpectedly produced zero distortion.");
+              $display("FAIL: max-distortion test unexpectedly produced zero distortion.");
           end
         endcase
 
@@ -283,7 +266,6 @@ module top_testbench;
       end
     end
 
-    // if we get here, DUT never finished
     $display("Timeout: completed never asserted.");
     $finish;
   end
