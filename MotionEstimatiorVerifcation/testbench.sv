@@ -106,7 +106,7 @@ module top_testbench;
       case (test_mode)
         0: begin
           $display("Running PERFECT MATCH test from search memory.");
-          make_ref_from_search(8, 7);   // pick a valid block
+          make_ref_from_search(8, 7);   // pick a valid block (row,column)
         end
 
         1: begin
