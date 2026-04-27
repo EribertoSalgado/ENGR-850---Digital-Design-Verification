@@ -8,61 +8,71 @@
 // test scenarios (perfect match, partial match, random).
 // It monitors outputs like BestDist and motion vectors and
 // checks if the DUT behaves as expected.
+// This version also uses a SystemVerilog interface to group the
+// DUT/testbench connection signals in one place.
 // ================================================================
+
+
+// ---------------------------------------------------------------
+// Interface: bundles signals shared by testbench, DUT, and memories
+// ---------------------------------------------------------------
+interface motion_if;
+  logic clock;
+  logic start;
+
+  logic [7:0] BestDist;
+  logic [3:0] motionX, motionY;
+  logic [7:0] AddressR;
+  logic [9:0] AddressS1, AddressS2;
+  logic [7:0] R, S1, S2;
+  logic completed;
+endinterface
+
 
 module top_testbench;
 
-  // Outputs from DUT / connections between modules
-  wire [7:0] BestDist;
-  wire [3:0] motionX, motionY;
-  wire [7:0] AddressR;
-  wire [9:0] AddressS1, AddressS2;
-  wire [7:0] R, S1, S2;
-  wire completed;
-
-  // Inputs driven by testbench
-  reg clock;
-  reg start;
+  // Instantiate interface
+  motion_if mif();
 
   // General purpose variables
   integer i;
   integer signed x, y;   // used to convert motion vectors to signed values
   integer test_mode;     // selects which test to run
 
-  // Instantiate DUT
+  // Instantiate DUT using interface signals
   top dut (
-    .clock(clock),
-    .start(start),
-    .BestDist(BestDist),
-    .motionX(motionX),
-    .motionY(motionY),
-    .AddressR(AddressR),
-    .AddressS1(AddressS1),
-    .AddressS2(AddressS2),
-    .R(R),
-    .S1(S1),
-    .S2(S2),
-    .completed(completed)
+    .clock(mif.clock),
+    .start(mif.start),
+    .BestDist(mif.BestDist),
+    .motionX(mif.motionX),
+    .motionY(mif.motionY),
+    .AddressR(mif.AddressR),
+    .AddressS1(mif.AddressS1),
+    .AddressS2(mif.AddressS2),
+    .R(mif.R),
+    .S1(mif.S1),
+    .S2(mif.S2),
+    .completed(mif.completed)
   );
 
   // Reference memory (16x16 block)
   ROM_R memR_u (
-    .clock(clock),
-    .AddressR(AddressR),
-    .R(R)
+    .clock(mif.clock),
+    .AddressR(mif.AddressR),
+    .R(mif.R)
   );
 
   // Search memory (32x32 block)
   ROM_S memS_u (
-    .clock(clock),
-    .AddressS1(AddressS1),
-    .AddressS2(AddressS2),
-    .S1(S1),
-    .S2(S2)
+    .clock(mif.clock),
+    .AddressS1(mif.AddressS1),
+    .AddressS2(mif.AddressS2),
+    .S1(mif.S1),
+    .S2(mif.S2)
   );
 
   // Simple clock generator (20ns period)
-  always #10 clock = ~clock;
+  always #10 mif.clock = ~mif.clock;
 
   // ---------------------------------------------------------------
   // Copy a 16x16 block from search memory into reference memory
@@ -85,7 +95,7 @@ module top_testbench;
       for (r = 0; r < 16; r = r + 1) begin
         for (c = 0; c < 16; c = c + 1) begin
           s_idx = (top_row + r) * 32 + (left_col + c); // index in search memory
-          r_idx = r * 16 + c;                         // index in reference memory
+          r_idx = r * 16 + c;                          // index in reference memory
           memR_u.Rmem[r_idx] = memS_u.Smem[s_idx];
         end
       end
@@ -169,23 +179,23 @@ module top_testbench;
   initial begin
     // waveform dump for GTKWave
     $dumpfile("dump.vcd");
-    $dumpvars(0, clock);
-    $dumpvars(0, start);
-    $dumpvars(0, BestDist);
-    $dumpvars(0, motionX);
-    $dumpvars(0, motionY);
-    $dumpvars(0, completed);
-    $dumpvars(0, AddressR);
-    $dumpvars(0, AddressS1);
-    $dumpvars(0, AddressS2);
-    $dumpvars(0, R);
-    $dumpvars(0, S1);
-    $dumpvars(0, S2);
+    $dumpvars(0, mif.clock);
+    $dumpvars(0, mif.start);
+    $dumpvars(0, mif.BestDist);
+    $dumpvars(0, mif.motionX);
+    $dumpvars(0, mif.motionY);
+    $dumpvars(0, mif.completed);
+    $dumpvars(0, mif.AddressR);
+    $dumpvars(0, mif.AddressS1);
+    $dumpvars(0, mif.AddressS2);
+    $dumpvars(0, mif.R);
+    $dumpvars(0, mif.S1);
+    $dumpvars(0, mif.S2);
     $dumpvars(0, dut.ctl_u.count); // internal counter (useful for debug)
 
     // initialize signals
-    clock = 0;
-    start = 0;
+    mif.clock = 0;
+    mif.start = 0;
 
     // choose test case here
     //test_mode = 0;
@@ -209,59 +219,59 @@ module top_testbench;
     $display("Starting simulation...");
 
     // wait one clock, then assert start
-    @(posedge clock);
-    #1 start = 1'b1;
+    @(posedge mif.clock);
+    #1 mif.start = 1'b1;
 
     // run simulation loop
     for (i = 0; i < 5000; i = i + 1) begin
-      @(posedge clock);
+      @(posedge mif.clock);
       #1;
 
       // print status every 100 cycles
       if ((i % 100) == 0) begin
         $display("cycle=%0d BestDist=%h motionX=%h motionY=%h count=%0d completed=%b",
-                 i, BestDist, motionX, motionY, dut.ctl_u.count, completed);
+                 i, mif.BestDist, mif.motionX, mif.motionY, dut.ctl_u.count, mif.completed);
       end
 
       // stop when DUT finishes
-      if (completed) begin
+      if (mif.completed) begin
         $display("Completed at cycle %0d", i);
-        start = 1'b0;
+        mif.start = 1'b0;
 
         // convert 4-bit values to signed (-8 to +7)
-        if (motionX >= 8) x = motionX - 16;
-        else              x = motionX;
+        if (mif.motionX >= 8) x = mif.motionX - 16;
+        else                  x = mif.motionX;
 
-        if (motionY >= 8) y = motionY - 16;
-        else              y = motionY;
+        if (mif.motionY >= 8) y = mif.motionY - 16;
+        else                  y = mif.motionY;
 
         // print final results
         $display("");
         $display("===== FINAL RESULT =====");
-        $display("BestDist = %0d (0x%0h)", BestDist, BestDist);
+        $display("BestDist = %0d (0x%0h)", mif.BestDist, mif.BestDist);
         $display("motionX  = %0d", x);
         $display("motionY  = %0d", y);
-        $display("completed = %b", completed);
+        $display("completed = %b", mif.completed);
         $display("========================");
 
         // simple pass/fail checks
         case (test_mode)
           0: begin
-            if (BestDist == 8'h00)
+            if (mif.BestDist == 8'h00)
               $display("PASS: perfect-match style test produced zero distortion.");
             else
               $display("FAIL: expected zero distortion for perfect-match file test.");
           end
 
           1: begin
-            if (BestDist != 8'h00 && BestDist != 8'hFF)
+            if (mif.BestDist != 8'h00 && mif.BestDist != 8'hFF)
               $display("PASS: partial-match style test produced non-zero distortion.");
             else
               $display("FAIL: partial-match test did not produce a useful non-zero BestDist.");
           end
 
           2: begin
-            if (BestDist != 8'h00)
+            if (mif.BestDist != 8'h00)
               $display("PASS: no-intended-match test produced non-zero distortion.");
             else
               $display("FAIL: no-intended-match test unexpectedly produced zero distortion.");
