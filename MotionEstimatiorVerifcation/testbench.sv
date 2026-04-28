@@ -91,10 +91,10 @@ module top_testbench;
           $display("Running PARTIAL / PERTURBED MATCH test from random search memory block.");
           make_ref_from_search(rand_top_row, rand_left_col);
 
-          memR_u.Rmem[1]   = memR_u.Rmem[1]   + 8'd1;
-          memR_u.Rmem[20]  = memR_u.Rmem[20]  + 8'd2;
-          memR_u.Rmem[55]  = memR_u.Rmem[55]  + 8'd1;
-          memR_u.Rmem[100] = memR_u.Rmem[100] + 8'd3;
+          memR_u.Rmem[1]   = memR_u.Rmem[1]   + 8'd3;
+          memR_u.Rmem[20]  = memR_u.Rmem[20]  + 8'd4;
+          memR_u.Rmem[55]  = memR_u.Rmem[55]  + 8'd5;
+          memR_u.Rmem[100] = memR_u.Rmem[100] + 8'd6;
         end
 
         2: begin
@@ -156,8 +156,8 @@ module top_testbench;
     start = 0;
 
     //test_mode = 0;
-    //test_mode = 1;
-    test_mode = 2;
+    test_mode = 1;
+    //test_mode = 2;
 
     // Optional: fixed seed for repeatable randomness
     //void'($urandom(32'h12345678));
