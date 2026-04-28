@@ -16,15 +16,10 @@ module top (
   output wire        completed
 );
 
-  wire [15:0] S1S2mux, newDist, PEready;
-  wire        CompStart;
-  wire [3:0]  VectorX, VectorY;
+  wire [15:0]  S1S2mux, newDist, PEready;
+  wire         CompStart;
+  wire [3:0]   VectorX, VectorY;
   wire [127:0] Accumulate;
-
-  // Delay comparator-side control by 1 cycle so it aligns with registered PE outputs
-  reg  [15:0] PEready_d;
-  reg         CompStart_d;
-  reg  [3:0]  VectorX_d, VectorY_d;
 
   control ctl_u (
     .clock(clock),
@@ -51,27 +46,19 @@ module top (
     .Accumulate(Accumulate)
   );
 
-  always @(posedge clock) begin
-    PEready_d   <= PEready;
-    CompStart_d <= CompStart;
-    VectorX_d   <= VectorX;
-    VectorY_d   <= VectorY;
-  end
-
   Comparator comp_u (
     .clock(clock),
-    .CompStart(CompStart_d),
+    .CompStart(CompStart),
     .PEout(Accumulate),
-    .PEready(PEready_d),
-    .vectorX(VectorX_d),
-    .vectorY(VectorY_d),
+    .PEready(PEready),
+    .vectorX(VectorX),
+    .vectorY(VectorY),
     .BestDist(BestDist),
     .motionX(motionX),
     .motionY(motionY)
   );
 
 endmodule
-
 
 /* Module For Processing Element (PE) */
 module PE (
@@ -212,71 +199,61 @@ endmodule
 
 /* Module For Comparator Unit */
 module Comparator (
-  input  wire         clock,
-  input  wire         CompStart,
-  input  wire [8*16-1:0] PEout,
-  input  wire [15:0]  PEready,
-  input  wire [3:0]   vectorX,
-  input  wire [3:0]   vectorY,
-  output reg  [7:0]   BestDist,
-  output reg  [3:0]   motionX,
-  output reg  [3:0]   motionY
+  input  wire           clock,
+  input  wire           CompStart,
+  input  wire [127:0]   PEout,
+  input  wire [15:0]    PEready,
+  input  wire [3:0]     vectorX,
+  input  wire [3:0]     vectorY,
+  output reg  [7:0]     BestDist,
+  output reg  [3:0]     motionX,
+  output reg  [3:0]     motionY
 );
 
-  reg [7:0] newDist;
-  reg       newBest;
-  integer   n;
+  reg [7:0] selectedDist;
+  reg       validDist;
+
+  always @(*) begin
+    validDist = 1'b1;
+
+    case (PEready)
+      16'b0000_0000_0000_0001: selectedDist = PEout[7:0];
+      16'b0000_0000_0000_0010: selectedDist = PEout[15:8];
+      16'b0000_0000_0000_0100: selectedDist = PEout[23:16];
+      16'b0000_0000_0000_1000: selectedDist = PEout[31:24];
+      16'b0000_0000_0001_0000: selectedDist = PEout[39:32];
+      16'b0000_0000_0010_0000: selectedDist = PEout[47:40];
+      16'b0000_0000_0100_0000: selectedDist = PEout[55:48];
+      16'b0000_0000_1000_0000: selectedDist = PEout[63:56];
+      16'b0000_0001_0000_0000: selectedDist = PEout[71:64];
+      16'b0000_0010_0000_0000: selectedDist = PEout[79:72];
+      16'b0000_0100_0000_0000: selectedDist = PEout[87:80];
+      16'b0000_1000_0000_0000: selectedDist = PEout[95:88];
+      16'b0001_0000_0000_0000: selectedDist = PEout[103:96];
+      16'b0010_0000_0000_0000: selectedDist = PEout[111:104];
+      16'b0100_0000_0000_0000: selectedDist = PEout[119:112];
+      16'b1000_0000_0000_0000: selectedDist = PEout[127:120];
+      default: begin
+        selectedDist = 8'hFF;
+        validDist    = 1'b0;
+      end
+    endcase
+  end
 
   always @(posedge clock) begin
-    if (CompStart == 1'b0) begin
+    if (!CompStart) begin
       BestDist <= 8'hFF;
       motionX  <= 4'd0;
       motionY  <= 4'd0;
     end
-    else if (newBest == 1'b1) begin
-      BestDist <= newDist;
+    else if (validDist && (selectedDist < BestDist)) begin
+      BestDist <= selectedDist;
       motionX  <= vectorX;
       motionY  <= vectorY;
     end
   end
 
-  always @(*) begin
-    newDist = 8'hFF;
-
-    for (n = 0; n <= 15; n = n + 1) begin
-      if (PEready[n]) begin
-        case (n)
-          0  : newDist = PEout[7:0];
-          1  : newDist = PEout[15:8];
-          2  : newDist = PEout[23:16];
-          3  : newDist = PEout[31:24];
-          4  : newDist = PEout[39:32];
-          5  : newDist = PEout[47:40];
-          6  : newDist = PEout[55:48];
-          7  : newDist = PEout[63:56];
-          8  : newDist = PEout[71:64];
-          9  : newDist = PEout[79:72];
-          10 : newDist = PEout[87:80];
-          11 : newDist = PEout[95:88];
-          12 : newDist = PEout[103:96];
-          13 : newDist = PEout[111:104];
-          14 : newDist = PEout[119:112];
-          15 : newDist = PEout[127:120];
-          default: newDist = 8'hFF;
-        endcase
-      end
-    end
-
-    if ((|PEready == 1'b0) || (CompStart == 1'b0))
-      newBest = 1'b0;
-    else if (newDist < BestDist)
-      newBest = 1'b1;
-    else
-      newBest = 1'b0;
-  end
-
 endmodule
-
 
 /* Module For Total 16 Processing Elements (PEtotal) */
 module PEtotal (
