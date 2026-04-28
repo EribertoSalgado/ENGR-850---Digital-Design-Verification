@@ -16,6 +16,9 @@ module top_testbench;
   integer signed x, y;
   integer test_mode;
 
+  integer rand_top_row;
+  integer rand_left_col;
+
   top dut (
     .clock(clock),
     .start(start),
@@ -74,15 +77,19 @@ module top_testbench;
 
   task apply_test_mode;
     begin
+      // Random valid 16x16 block location inside 32x32 search area
+      rand_top_row  = $urandom % 17;   // 0..16
+      rand_left_col = $urandom % 17;   // 0..16
+
       case (test_mode)
         0: begin
-          $display("Running PERFECT MATCH test from search memory.");
-          make_ref_from_search(8, 7);   // example valid block
+          $display("Running PERFECT MATCH test from random search memory block.");
+          make_ref_from_search(rand_top_row, rand_left_col);
         end
 
         1: begin
-          $display("Running PARTIAL / PERTURBED MATCH test.");
-          make_ref_from_search(8, 7);
+          $display("Running PARTIAL / PERTURBED MATCH test from random search memory block.");
+          make_ref_from_search(rand_top_row, rand_left_col);
 
           memR_u.Rmem[1]   = memR_u.Rmem[1]   + 8'd1;
           memR_u.Rmem[20]  = memR_u.Rmem[20]  + 8'd2;
@@ -98,8 +105,8 @@ module top_testbench;
         end
 
         default: begin
-          $display("Unknown test_mode. Using perfect match.");
-          make_ref_from_search(8, 7);
+          $display("Unknown test_mode. Using random perfect match.");
+          make_ref_from_search(rand_top_row, rand_left_col);
         end
       endcase
     end
@@ -152,10 +159,10 @@ module top_testbench;
     //test_mode = 1;
     test_mode = 2;
 
-    // Search comes from file
-    $readmemh("search.txt", memS_u.Smem);
+    // Optional: fixed seed for repeatable randomness
+    //void'($urandom(32'h12345678));
 
-    // Ref file can still be loaded, but may be overwritten by test mode
+    $readmemh("search.txt", memS_u.Smem);
     $readmemh("ref.txt", memR_u.Rmem);
 
     apply_test_mode();
