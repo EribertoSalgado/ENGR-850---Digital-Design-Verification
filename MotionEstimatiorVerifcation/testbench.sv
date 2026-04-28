@@ -1,101 +1,68 @@
 `timescale 1ns/1ps
 
-// ================================================================
-// Author: Eriberto Salgado
-// Description:
-// This is a testbench for the `top` module. It drives the design,
-// loads reference/search memory from files, and runs different
-// test scenarios (perfect match, partial match, random).
-// It monitors outputs like BestDist and motion vectors and
-// checks if the DUT behaves as expected.
-// This version also uses a SystemVerilog interface to group the
-// DUT/testbench connection signals in one place.
-// ================================================================
-
-
-// ---------------------------------------------------------------
-// Interface: bundles signals shared by testbench, DUT, and memories
-// ---------------------------------------------------------------
-interface motion_if;
-  logic clock;
-  logic start;
-
-  logic [7:0] BestDist;
-  logic [3:0] motionX, motionY;
-  logic [7:0] AddressR;
-  logic [9:0] AddressS1, AddressS2;
-  logic [7:0] R, S1, S2;
-  logic completed;
-endinterface
-
-
 module top_testbench;
 
-  // Instantiate interface
-  motion_if mif();
+  wire [7:0] BestDist;
+  wire [3:0] motionX, motionY;
+  wire [7:0] AddressR;
+  wire [9:0] AddressS1, AddressS2;
+  wire [7:0] R, S1, S2;
+  wire completed;
 
-  // General purpose variables
+  reg clock;
+  reg start;
+
   integer i;
-  integer signed x, y;   // used to convert motion vectors to signed values
-  integer test_mode;     // selects which test to run
+  integer signed x, y;
+  integer test_mode;
 
-  // Instantiate DUT using interface signals
   top dut (
-    .clock(mif.clock),
-    .start(mif.start),
-    .BestDist(mif.BestDist),
-    .motionX(mif.motionX),
-    .motionY(mif.motionY),
-    .AddressR(mif.AddressR),
-    .AddressS1(mif.AddressS1),
-    .AddressS2(mif.AddressS2),
-    .R(mif.R),
-    .S1(mif.S1),
-    .S2(mif.S2),
-    .completed(mif.completed)
+    .clock(clock),
+    .start(start),
+    .BestDist(BestDist),
+    .motionX(motionX),
+    .motionY(motionY),
+    .AddressR(AddressR),
+    .AddressS1(AddressS1),
+    .AddressS2(AddressS2),
+    .R(R),
+    .S1(S1),
+    .S2(S2),
+    .completed(completed)
   );
 
-  // Reference memory (16x16 block)
   ROM_R memR_u (
-    .clock(mif.clock),
-    .AddressR(mif.AddressR),
-    .R(mif.R)
+    .clock(clock),
+    .AddressR(AddressR),
+    .R(R)
   );
 
-  // Search memory (32x32 block)
   ROM_S memS_u (
-    .clock(mif.clock),
-    .AddressS1(mif.AddressS1),
-    .AddressS2(mif.AddressS2),
-    .S1(mif.S1),
-    .S2(mif.S2)
+    .clock(clock),
+    .AddressS1(AddressS1),
+    .AddressS2(AddressS2),
+    .S1(S1),
+    .S2(S2)
   );
 
-  // Simple clock generator (20ns period)
-  always #10 mif.clock = ~mif.clock;
+  always #10 clock = ~clock;
 
-  // ---------------------------------------------------------------
-  // Copy a 16x16 block from search memory into reference memory
-  // This is used to create a "perfect match" scenario
-  // ---------------------------------------------------------------
   task make_ref_from_search;
     input integer top_row;   // valid range: 0..16
     input integer left_col;  // valid range: 0..16
     integer r, c;
     integer s_idx, r_idx;
     begin
-      // Make sure requested block is within bounds
       if (top_row < 0 || top_row > 16 || left_col < 0 || left_col > 16) begin
         $display("ERROR: make_ref_from_search out of range. top_row=%0d left_col=%0d",
                  top_row, left_col);
         $finish;
       end
 
-      // Copy 16x16 block from search (32x32) into reference (16x16)
       for (r = 0; r < 16; r = r + 1) begin
         for (c = 0; c < 16; c = c + 1) begin
-          s_idx = (top_row + r) * 32 + (left_col + c); // index in search memory
-          r_idx = r * 16 + c;                          // index in reference memory
+          s_idx = (top_row + r) * 32 + (left_col + c);
+          r_idx = r * 16 + c;
           memR_u.Rmem[r_idx] = memS_u.Smem[s_idx];
         end
       end
@@ -105,46 +72,28 @@ module top_testbench;
     end
   endtask
 
-  // ---------------------------------------------------------------
-  // Select test behavior
-  // 0 = perfect match
-  // 1 = partial / perturbed match
-  // 2 = max-distortion test
-  // ---------------------------------------------------------------
   task apply_test_mode;
     begin
       case (test_mode)
         0: begin
           $display("Running PERFECT MATCH test from search memory.");
-          make_ref_from_search(8, 7);
+          make_ref_from_search(8, 7);   // example valid block
         end
 
         1: begin
           $display("Running PARTIAL / PERTURBED MATCH test.");
           make_ref_from_search(8, 7);
 
-          // Make the perturbation clearly visible to the DUT
-          memR_u.Rmem[1]   = 8'h20;
-          memR_u.Rmem[20]  = 8'h40;
-          memR_u.Rmem[55]  = 8'h60;
-          memR_u.Rmem[100] = 8'h80;
-
-          $display("Perturbed pixels:");
-          $display("Rmem[1]   = %02h", memR_u.Rmem[1]);
-          $display("Rmem[20]  = %02h", memR_u.Rmem[20]);
-          $display("Rmem[55]  = %02h", memR_u.Rmem[55]);
-          $display("Rmem[100] = %02h", memR_u.Rmem[100]);
+          memR_u.Rmem[1]   = memR_u.Rmem[1]   + 8'd1;
+          memR_u.Rmem[20]  = memR_u.Rmem[20]  + 8'd2;
+          memR_u.Rmem[55]  = memR_u.Rmem[55]  + 8'd1;
+          memR_u.Rmem[100] = memR_u.Rmem[100] + 8'd3;
         end
 
         2: begin
-          $display("Running MAX-DISTORTION test (Ref = FF, Search = 00).");
-
-          foreach (memR_u.Rmem[i]) begin
+          $display("Running NO-INTENDED-MATCH test.");
+          for (i = 0; i < 256; i = i + 1) begin
             memR_u.Rmem[i] = 8'hFF;
-          end
-
-          foreach (memS_u.Smem[i]) begin
-            memS_u.Smem[i] = 8'h00;
           end
         end
 
@@ -156,9 +105,6 @@ module top_testbench;
     end
   endtask
 
-  // ---------------------------------------------------------------
-  // Dump both memories to console (for debugging)
-  // ---------------------------------------------------------------
   task print_memories;
     integer row, col;
     begin
@@ -183,24 +129,37 @@ module top_testbench;
     end
   endtask
 
-  // ---------------------------------------------------------------
-  // Main simulation flow
-  // ---------------------------------------------------------------
   initial begin
     $dumpfile("dump.vcd");
-    $dumpvars(0, top_testbench);
+    $dumpvars(0, clock);
+    $dumpvars(0, start);
+    $dumpvars(0, BestDist);
+    $dumpvars(0, motionX);
+    $dumpvars(0, motionY);
+    $dumpvars(0, completed);
+    $dumpvars(0, AddressR);
+    $dumpvars(0, AddressS1);
+    $dumpvars(0, AddressS2);
+    $dumpvars(0, R);
+    $dumpvars(0, S1);
+    $dumpvars(0, S2);
+    $dumpvars(0, dut.ctl_u.count);
 
-    mif.clock = 0;
-    mif.start = 0;
+    clock = 0;
+    start = 0;
 
     //test_mode = 0;
-    test_mode = 1;
-    //test_mode = 2;
+    //test_mode = 1;
+    test_mode = 2;
 
+    // Search comes from file
     $readmemh("search.txt", memS_u.Smem);
+
+    // Ref file can still be loaded, but may be overwritten by test mode
     $readmemh("ref.txt", memR_u.Rmem);
 
     apply_test_mode();
+
     print_memories();
 
     $writememh("search_dump.txt", memS_u.Smem);
@@ -208,56 +167,56 @@ module top_testbench;
 
     $display("Starting simulation...");
 
-    @(posedge mif.clock);
-    #1 mif.start = 1'b1;
+    @(posedge clock);
+    #1 start = 1'b1;
 
     for (i = 0; i < 5000; i = i + 1) begin
-      @(posedge mif.clock);
+      @(posedge clock);
       #1;
 
       if ((i % 100) == 0) begin
         $display("cycle=%0d BestDist=%h motionX=%h motionY=%h count=%0d completed=%b",
-                 i, mif.BestDist, mif.motionX, mif.motionY, dut.ctl_u.count, mif.completed);
+                 i, BestDist, motionX, motionY, dut.ctl_u.count, completed);
       end
 
-      if (mif.completed) begin
+      if (completed) begin
         $display("Completed at cycle %0d", i);
-        mif.start = 1'b0;
+        start = 1'b0;
 
-        if (mif.motionX >= 8) x = mif.motionX - 16;
-        else                  x = mif.motionX;
+        if (motionX >= 8) x = motionX - 16;
+        else              x = motionX;
 
-        if (mif.motionY >= 8) y = mif.motionY - 16;
-        else                  y = mif.motionY;
+        if (motionY >= 8) y = motionY - 16;
+        else              y = motionY;
 
         $display("");
         $display("===== FINAL RESULT =====");
-        $display("BestDist = %0d (0x%0h)", mif.BestDist, mif.BestDist);
+        $display("BestDist = %0d (0x%0h)", BestDist, BestDist);
         $display("motionX  = %0d", x);
         $display("motionY  = %0d", y);
-        $display("completed = %b", mif.completed);
+        $display("completed = %b", completed);
         $display("========================");
 
         case (test_mode)
           0: begin
-            if (mif.BestDist == 8'h00)
+            if (BestDist == 8'h00)
               $display("PASS: perfect-match style test produced zero distortion.");
             else
               $display("FAIL: expected zero distortion for perfect-match file test.");
           end
 
           1: begin
-            if (mif.BestDist != 8'h00 && mif.BestDist != 8'hFF)
+            if (BestDist != 8'h00 && BestDist != 8'hFF)
               $display("PASS: partial-match style test produced non-zero distortion.");
             else
               $display("FAIL: partial-match test did not produce a useful non-zero BestDist.");
           end
 
           2: begin
-            if (mif.BestDist != 8'h00)
-              $display("PASS: max-distortion test produced non-zero distortion.");
+            if (BestDist != 8'h00)
+              $display("PASS: no-intended-match test produced non-zero distortion.");
             else
-              $display("FAIL: max-distortion test unexpectedly produced zero distortion.");
+              $display("FAIL: no-intended-match test unexpectedly produced zero distortion.");
           end
         endcase
 
