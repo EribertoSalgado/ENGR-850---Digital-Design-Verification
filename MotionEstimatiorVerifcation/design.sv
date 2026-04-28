@@ -1,297 +1,356 @@
 `timescale 1ns/1ps
 
-// ================================================================
-// Author: Eriberto Salgado
-// Description:
-// This is a testbench for the `top` module. It drives the design,
-// loads reference/search memory from files, and runs different
-// test scenarios (perfect match, partial match, random).
-// It monitors outputs like BestDist and motion vectors and
-// checks if the DUT behaves as expected.
-// This version also uses a SystemVerilog interface to group the
-// DUT/testbench connection signals in one place.
-// ================================================================
+/* Module For Top Level Hierarchy */
+module top (
+  input  wire        clock,
+  input  wire        start,
+  output wire [7:0]  BestDist,
+  output wire [3:0]  motionX,
+  output wire [3:0]  motionY,
+  output wire [7:0]  AddressR,
+  output wire [9:0]  AddressS1,
+  output wire [9:0]  AddressS2,
+  input  wire [7:0]  R,
+  input  wire [7:0]  S1,
+  input  wire [7:0]  S2,
+  output wire        completed
+);
+
+  wire [15:0] S1S2mux, newDist, PEready;
+  wire        CompStart;
+  wire [3:0]  VectorX, VectorY;
+  wire [127:0] Accumulate;
+
+  // Delay comparator-side control by 1 cycle so it aligns with registered PE outputs
+  reg  [15:0] PEready_d;
+  reg         CompStart_d;
+  reg  [3:0]  VectorX_d, VectorY_d;
+
+  control ctl_u (
+    .clock(clock),
+    .start(start),
+    .S1S2mux(S1S2mux),
+    .newDist(newDist),
+    .CompStart(CompStart),
+    .PEready(PEready),
+    .VectorX(VectorX),
+    .VectorY(VectorY),
+    .AddressR(AddressR),
+    .AddressS1(AddressS1),
+    .AddressS2(AddressS2),
+    .completed(completed)
+  );
+
+  PEtotal pe_u (
+    .clock(clock),
+    .R(R),
+    .S1(S1),
+    .S2(S2),
+    .S1S2mux(S1S2mux),
+    .newDist(newDist),
+    .Accumulate(Accumulate)
+  );
+
+  always @(posedge clock) begin
+    PEready_d   <= PEready;
+    CompStart_d <= CompStart;
+    VectorX_d   <= VectorX;
+    VectorY_d   <= VectorY;
+  end
+
+  Comparator comp_u (
+    .clock(clock),
+    .CompStart(CompStart_d),
+    .PEout(Accumulate),
+    .PEready(PEready_d),
+    .vectorX(VectorX_d),
+    .vectorY(VectorY_d),
+    .BestDist(BestDist),
+    .motionX(motionX),
+    .motionY(motionY)
+  );
+
+endmodule
 
 
-// ---------------------------------------------------------------
-// Interface: bundles signals shared by testbench, DUT, and memories
-// ---------------------------------------------------------------
-interface motion_if;
-  logic clock;
-  logic start;
+/* Module For Processing Element (PE) */
+module PE (
+  input  wire       clock,
+  input  wire [7:0] R,
+  input  wire [7:0] S1,
+  input  wire [7:0] S2,
+  input  wire       S1S2mux,
+  input  wire       newDist,
+  output reg  [7:0] Accumulate,
+  output reg  [7:0] Rpipe
+);
 
-  logic [7:0] BestDist;
-  logic [3:0] motionX, motionY;
-  logic [7:0] AddressR;
-  logic [9:0] AddressS1, AddressS2;
-  logic [7:0] R, S1, S2;
-  logic completed;
-endinterface
+  reg  [7:0] AccumulateIn;
+  reg  [7:0] pixel_sel;
+  reg  [7:0] difference;
+  reg        Carry;
+
+  always @(posedge clock) begin
+    Rpipe      <= R;
+    Accumulate <= AccumulateIn;
+  end
+
+  always @(*) begin
+    pixel_sel = (S1S2mux ? S1 : S2);
+
+    if (R >= pixel_sel)
+      difference = R - pixel_sel;
+    else
+      difference = pixel_sel - R;
+
+    {Carry, AccumulateIn} = Accumulate + difference;
+
+    if (Carry)
+      AccumulateIn = 8'hFF; // saturated
+
+    if (newDist)
+      AccumulateIn = difference;
+  end
+
+endmodule
 
 
-module top_testbench;
+/* Module For The Last Processing Element (PEend) */
+module PEend (
+  input  wire       clock,
+  input  wire [7:0] R,
+  input  wire [7:0] S1,
+  input  wire [7:0] S2,
+  input  wire       S1S2mux,
+  input  wire       newDist,
+  output reg  [7:0] Accumulate
+);
 
-  // Instantiate interface
-  motion_if mif();
+  reg  [7:0] AccumulateIn;
+  reg  [7:0] pixel_sel;
+  reg  [7:0] difference;
+  reg        Carry;
 
-  // General purpose variables
+  always @(posedge clock) begin
+    Accumulate <= AccumulateIn;
+  end
+
+  always @(*) begin
+    pixel_sel = (S1S2mux ? S1 : S2);
+
+    if (R >= pixel_sel)
+      difference = R - pixel_sel;
+    else
+      difference = pixel_sel - R;
+
+    {Carry, AccumulateIn} = Accumulate + difference;
+
+    if (Carry)
+      AccumulateIn = 8'hFF; // saturated
+
+    if (newDist)
+      AccumulateIn = difference;
+  end
+
+endmodule
+
+
+/* Module For Control Unit */
+module control (
+  input  wire        clock,
+  input  wire        start,
+  output reg  [15:0] S1S2mux,
+  output reg  [15:0] newDist,
+  output reg         CompStart,
+  output reg  [15:0] PEready,
+  output reg  [3:0]  VectorX,
+  output reg  [3:0]  VectorY,
+  output reg  [7:0]  AddressR,
+  output reg  [9:0]  AddressS1,
+  output reg  [9:0]  AddressS2,
+  output reg         completed
+);
+
+  parameter count_complete = 16*(16*16) + 15; // 4111
+
+  reg [12:0] count, count_temp;
+  reg [11:0] temp;
   integer i;
-  integer signed x, y;   // used to convert motion vectors to signed values
-  integer test_mode;     // selects which test to run
 
-  // Instantiate DUT using interface signals
-  top dut (
-    .clock(mif.clock),
-    .start(mif.start),
-    .BestDist(mif.BestDist),
-    .motionX(mif.motionX),
-    .motionY(mif.motionY),
-    .AddressR(mif.AddressR),
-    .AddressS1(mif.AddressS1),
-    .AddressS2(mif.AddressS2),
-    .R(mif.R),
-    .S1(mif.S1),
-    .S2(mif.S2),
-    .completed(mif.completed)
-  );
+  always @(posedge clock) begin
+    if (start == 1'b0)
+      count <= 13'b0;
+    else if (completed == 1'b0)
+      count <= count_temp;
+  end
 
-  // Reference memory (16x16 block)
-  ROM_R memR_u (
-    .clock(mif.clock),
-    .AddressR(mif.AddressR),
-    .R(mif.R)
-  );
+  always @(*) begin
+    count_temp = count + 13'b1;
 
-  // Search memory (32x32 block)
-  ROM_S memS_u (
-    .clock(mif.clock),
-    .AddressS1(mif.AddressS1),
-    .AddressS2(mif.AddressS2),
-    .S1(mif.S1),
-    .S2(mif.S2)
-  );
-
-  // Simple clock generator (20ns period)
-  always #10 mif.clock = ~mif.clock;
-
-  // ---------------------------------------------------------------
-  // Copy a 16x16 block from search memory into reference memory
-  // This is used to create a "perfect match" scenario
-  // ---------------------------------------------------------------
-  task make_ref_from_search;
-    input integer top_row;   // valid range: 0..16
-    input integer left_col;  // valid range: 0..16
-    integer r, c;
-    integer s_idx, r_idx;
-    begin
-      // Make sure requested block is within bounds
-      if (top_row < 0 || top_row > 16 || left_col < 0 || left_col > 16) begin
-        $display("ERROR: make_ref_from_search out of range. top_row=%0d left_col=%0d",
-                 top_row, left_col);
-        $finish;
-      end
-
-      // Copy 16x16 block from search (32x32) into reference (16x16)
-      for (r = 0; r < 16; r = r + 1) begin
-        for (c = 0; c < 16; c = c + 1) begin
-          s_idx = (top_row + r) * 32 + (left_col + c); // index in search memory
-          r_idx = r * 16 + c;                          // index in reference memory
-          memR_u.Rmem[r_idx] = memS_u.Smem[s_idx];
-        end
-      end
-
-      $display("Reference copied from Search block: top_row=%0d left_col=%0d",
-               top_row, left_col);
+    for (i = 0; i < 16; i = i + 1) begin
+      newDist[i] = (count[7:0] == i[7:0]);
+      PEready[i] = (newDist[i] && !(count < 13'd256));
+      S1S2mux[i] = (count[3:0] >= i[3:0]);
     end
-  endtask
 
-  // ---------------------------------------------------------------
-  // Select test behavior
-  // 0 = perfect match
-  // 1 = slightly modified match
-  // 2 = completely random reference
-  // ---------------------------------------------------------------
-  task apply_test_mode;
-    begin
-      case (test_mode)
-        0: begin
-          $display("Running PERFECT MATCH test from search memory.");
-          make_ref_from_search(8, 7);   // pick a valid block (row,column)
-        end
+    CompStart = !(count < 13'd256);
 
-        1: begin
-          $display("Running PARTIAL / PERTURBED MATCH test.");
-          make_ref_from_search(8, 7);
+    AddressR  = count[7:0];
+    AddressS1 = (count[11:8] + count[7:4]) * 32 + count[3:0];
 
-          // introduce small changes to a few pixels
-          memR_u.Rmem[1]   = memR_u.Rmem[1]   + 8'd1;
-          memR_u.Rmem[20]  = memR_u.Rmem[20]  + 8'd2;
-          memR_u.Rmem[55]  = memR_u.Rmem[55]  + 8'd1;
-          memR_u.Rmem[100] = memR_u.Rmem[100] + 8'd3;
-        end
+    temp      = count[11:0] - 12'd16;
+    AddressS2 = (temp[11:8] + temp[7:4]) * 32 + temp[3:0] + 10'd16;
 
-        2: begin
-          $display("Running MAX-DISTORTION test (Ref = FF, Search = 00).");
+    VectorX   = count[3:0] - 4'd8;
+    VectorY   = count[11:8] - 4'd9;
 
-          // Force reference block to all 0xFF
-          foreach (memR_u.Rmem[i]) begin
-            memR_u.Rmem[i] = 8'hFF;
-          end
+    completed = (count == count_complete[12:0]);
+  end
 
-          // Optional but safer: force search to all 0x00
-          foreach (memS_u.Smem[i]) begin
-            memS_u.Smem[i] = 8'h00;
-          end
-        end
+endmodule
 
-        default: begin
-          $display("Unknown test_mode. Using perfect match.");
-          make_ref_from_search(8, 7);
-        end
-      endcase
+
+/* Module For Comparator Unit */
+module Comparator (
+  input  wire         clock,
+  input  wire         CompStart,
+  input  wire [8*16-1:0] PEout,
+  input  wire [15:0]  PEready,
+  input  wire [3:0]   vectorX,
+  input  wire [3:0]   vectorY,
+  output reg  [7:0]   BestDist,
+  output reg  [3:0]   motionX,
+  output reg  [3:0]   motionY
+);
+
+  reg [7:0] newDist;
+  reg       newBest;
+  integer   n;
+
+  always @(posedge clock) begin
+    if (CompStart == 1'b0) begin
+      BestDist <= 8'hFF;
+      motionX  <= 4'd0;
+      motionY  <= 4'd0;
     end
-  endtask
-
-  // ---------------------------------------------------------------
-  // Dump both memories to console (for debugging)
-  // ---------------------------------------------------------------
-  task print_memories;
-    integer row, col;
-    begin
-      $display("");
-      $display("Reference Memory content:");
-      for (row = 0; row < 256; row = row + 16) begin
-        for (col = 0; col < 16; col = col + 1) begin
-          $write("%02h ", memR_u.Rmem[row + col]);
-        end
-        $write("\n");
-      end
-
-      $display("");
-      $display("Search Memory content:");
-      for (row = 0; row < 1024; row = row + 32) begin
-        for (col = 0; col < 32; col = col + 1) begin
-          $write("%02h ", memS_u.Smem[row + col]);
-        end
-        $write("\n");
-      end
-      $display("");
+    else if (newBest == 1'b1) begin
+      BestDist <= newDist;
+      motionX  <= vectorX;
+      motionY  <= vectorY;
     end
-  endtask
+  end
 
-  // ---------------------------------------------------------------
-  // Main simulation flow
-  // ---------------------------------------------------------------
-  initial begin
-    // waveform dump for GTKWave
-    $dumpfile("dump.vcd");
-    $dumpvars(0, mif.clock);
-    $dumpvars(0, mif.start);
-    $dumpvars(0, mif.BestDist);
-    $dumpvars(0, mif.motionX);
-    $dumpvars(0, mif.motionY);
-    $dumpvars(0, mif.completed);
-    $dumpvars(0, mif.AddressR);
-    $dumpvars(0, mif.AddressS1);
-    $dumpvars(0, mif.AddressS2);
-    $dumpvars(0, mif.R);
-    $dumpvars(0, mif.S1);
-    $dumpvars(0, mif.S2);
-    $dumpvars(0, dut.ctl_u.count); // internal counter (useful for debug)
+  always @(*) begin
+    newDist = 8'hFF;
 
-    // initialize signals
-    mif.clock = 0;
-    mif.start = 0;
-
-    // choose test case here
-    //test_mode = 0;
-    //test_mode = 1;
-    test_mode = 2;
-
-    // load memory contents from files
-    $readmemh("search.txt", memS_u.Smem);
-    $readmemh("ref.txt", memR_u.Rmem);
-
-    // apply selected test mode (may overwrite ref memory)
-    apply_test_mode();
-
-    // print contents to console
-    print_memories();
-
-    // dump memories to files for inspection
-    $writememh("search_dump.txt", memS_u.Smem);
-    $writememh("ref_randomized.txt", memR_u.Rmem);
-
-    $display("Starting simulation...");
-
-    // wait one clock, then assert start
-    @(posedge mif.clock);
-    #1 mif.start = 1'b1;
-
-    // run simulation loop
-    for (i = 0; i < 5000; i = i + 1) begin
-      @(posedge mif.clock);
-      #1;
-
-      // print status every 100 cycles
-      if ((i % 100) == 0) begin
-        $display("cycle=%0d BestDist=%h motionX=%h motionY=%h count=%0d completed=%b",
-                 i, mif.BestDist, mif.motionX, mif.motionY, dut.ctl_u.count, mif.completed);
-      end
-
-      // stop when DUT finishes
-      if (mif.completed) begin
-        $display("Completed at cycle %0d", i);
-        mif.start = 1'b0;
-
-        // convert 4-bit values to signed (-8 to +7)
-        if (mif.motionX >= 8) x = mif.motionX - 16;
-        else                  x = mif.motionX;
-
-        if (mif.motionY >= 8) y = mif.motionY - 16;
-        else                  y = mif.motionY;
-
-        // print final results
-        $display("");
-        $display("===== FINAL RESULT =====");
-        $display("BestDist = %0d (0x%0h)", mif.BestDist, mif.BestDist);
-        $display("motionX  = %0d", x);
-        $display("motionY  = %0d", y);
-        $display("completed = %b", mif.completed);
-        $display("========================");
-
-        // simple pass/fail checks
-        case (test_mode)
-          0: begin
-            if (mif.BestDist == 8'h00)
-              $display("PASS: perfect-match style test produced zero distortion.");
-            else
-              $display("FAIL: expected zero distortion for perfect-match file test.");
-          end
-
-          1: begin
-            if (mif.BestDist != 8'h00 && mif.BestDist != 8'hFF)
-              $display("PASS: partial-match style test produced non-zero distortion.");
-            else
-              $display("FAIL: partial-match test did not produce a useful non-zero BestDist.");
-          end
-
-          2: begin
-            if (mif.BestDist != 8'h00)
-              $display("PASS: no-intended-match test produced non-zero distortion.");
-            else
-              $display("FAIL: no-intended-match test unexpectedly produced zero distortion.");
-          end
+    for (n = 0; n <= 15; n = n + 1) begin
+      if (PEready[n]) begin
+        case (n)
+          0  : newDist = PEout[7:0];
+          1  : newDist = PEout[15:8];
+          2  : newDist = PEout[23:16];
+          3  : newDist = PEout[31:24];
+          4  : newDist = PEout[39:32];
+          5  : newDist = PEout[47:40];
+          6  : newDist = PEout[55:48];
+          7  : newDist = PEout[63:56];
+          8  : newDist = PEout[71:64];
+          9  : newDist = PEout[79:72];
+          10 : newDist = PEout[87:80];
+          11 : newDist = PEout[95:88];
+          12 : newDist = PEout[103:96];
+          13 : newDist = PEout[111:104];
+          14 : newDist = PEout[119:112];
+          15 : newDist = PEout[127:120];
+          default: newDist = 8'hFF;
         endcase
-
-        #20;
-        $finish;
       end
     end
 
-    // if we get here, DUT never finished
-    $display("Timeout: completed never asserted.");
-    $finish;
+    if ((|PEready == 1'b0) || (CompStart == 1'b0))
+      newBest = 1'b0;
+    else if (newDist < BestDist)
+      newBest = 1'b1;
+    else
+      newBest = 1'b0;
+  end
+
+endmodule
+
+
+/* Module For Total 16 Processing Elements (PEtotal) */
+module PEtotal (
+  input  wire         clock,
+  input  wire [7:0]   R,
+  input  wire [7:0]   S1,
+  input  wire [7:0]   S2,
+  input  wire [15:0]  S1S2mux,
+  input  wire [15:0]  newDist,
+  output wire [127:0] Accumulate
+);
+
+  wire [7:0] Rpipe0, Rpipe1, Rpipe2, Rpipe3, Rpipe4, Rpipe5, Rpipe6, Rpipe7;
+  wire [7:0] Rpipe8, Rpipe9, Rpipe10, Rpipe11, Rpipe12, Rpipe13, Rpipe14;
+
+  PE pe0   (clock, R,       S1, S2, S1S2mux[0],  newDist[0],  Accumulate[7:0],    Rpipe0);
+  PE pe1   (clock, Rpipe0,  S1, S2, S1S2mux[1],  newDist[1],  Accumulate[15:8],   Rpipe1);
+  PE pe2   (clock, Rpipe1,  S1, S2, S1S2mux[2],  newDist[2],  Accumulate[23:16],  Rpipe2);
+  PE pe3   (clock, Rpipe2,  S1, S2, S1S2mux[3],  newDist[3],  Accumulate[31:24],  Rpipe3);
+  PE pe4   (clock, Rpipe3,  S1, S2, S1S2mux[4],  newDist[4],  Accumulate[39:32],  Rpipe4);
+  PE pe5   (clock, Rpipe4,  S1, S2, S1S2mux[5],  newDist[5],  Accumulate[47:40],  Rpipe5);
+  PE pe6   (clock, Rpipe5,  S1, S2, S1S2mux[6],  newDist[6],  Accumulate[55:48],  Rpipe6);
+  PE pe7   (clock, Rpipe6,  S1, S2, S1S2mux[7],  newDist[7],  Accumulate[63:56],  Rpipe7);
+  PE pe8   (clock, Rpipe7,  S1, S2, S1S2mux[8],  newDist[8],  Accumulate[71:64],  Rpipe8);
+  PE pe9   (clock, Rpipe8,  S1, S2, S1S2mux[9],  newDist[9],  Accumulate[79:72],  Rpipe9);
+  PE pe10  (clock, Rpipe9,  S1, S2, S1S2mux[10], newDist[10], Accumulate[87:80],  Rpipe10);
+  PE pe11  (clock, Rpipe10, S1, S2, S1S2mux[11], newDist[11], Accumulate[95:88],  Rpipe11);
+  PE pe12  (clock, Rpipe11, S1, S2, S1S2mux[12], newDist[12], Accumulate[103:96], Rpipe12);
+  PE pe13  (clock, Rpipe12, S1, S2, S1S2mux[13], newDist[13], Accumulate[111:104], Rpipe13);
+  PE pe14  (clock, Rpipe13, S1, S2, S1S2mux[14], newDist[14], Accumulate[119:112], Rpipe14);
+
+  PEend pe15 (
+    .clock(clock),
+    .R(Rpipe14),
+    .S1(S1),
+    .S2(S2),
+    .S1S2mux(S1S2mux[15]),
+    .newDist(newDist[15]),
+    .Accumulate(Accumulate[127:120])
+  );
+
+endmodule
+
+
+/* Module For Reference Block (Memory) */
+module ROM_R (
+  input  wire       clock,
+  input  wire [7:0] AddressR,
+  output reg  [7:0] R
+);
+
+  reg [7:0] Rmem[0:255];
+
+  always @(*) begin
+    R = Rmem[AddressR];
+  end
+
+endmodule
+
+
+/* Module For Search Block (Memory) */
+module ROM_S (
+  input  wire        clock,
+  input  wire [9:0]  AddressS1,
+  input  wire [9:0]  AddressS2,
+  output reg  [7:0]  S1,
+  output reg  [7:0]  S2
+);
+
+  reg [7:0] Smem[0:1023];
+
+  always @(*) begin
+    S1 = Smem[AddressS1];
+    S2 = Smem[AddressS2];
   end
 
 endmodule
