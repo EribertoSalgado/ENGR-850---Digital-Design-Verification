@@ -158,8 +158,8 @@ module control (
   output reg         completed
 );
 
-  parameter count_complete = 16*(16*16) + 15; // 4111
-
+  parameter count_complete = 16*(16*16) + 16; // 4112
+  
   reg [12:0] count, count_temp;
   reg [11:0] temp;
   integer i;
