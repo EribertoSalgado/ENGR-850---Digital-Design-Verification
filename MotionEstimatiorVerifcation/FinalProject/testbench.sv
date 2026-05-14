@@ -1,6 +1,5 @@
 `timescale 1ns/1ps
 
-// Simple interface to bundle DUT signals together
 interface top_if;
 
   logic [7:0] BestDist;
@@ -13,21 +12,627 @@ interface top_if;
   logic clock;
   logic start;
 
+  logic [7:0] Rmem[0:255];
+  logic [7:0] Smem[0:1023];
+
+  always_comb begin
+    R  = Rmem[AddressR];
+    S1 = Smem[AddressS1];
+    S2 = Smem[AddressS2];
+  end
+
 endinterface
+
+
+typedef enum int {
+  TEST_PERFECT   = 0,
+  TEST_PERTURBED = 1
+} test_kind_e;
+
+
+class motion_transaction;
+
+  rand test_kind_e kind;
+  rand int unsigned target_top_row;
+  rand int unsigned target_left_col;
+  rand int unsigned perturb_count;
+
+  int unsigned id;
+  byte unsigned ref_mem[0:255];
+  byte unsigned search_mem[0:1023];
+
+  int signed expected_motion_x;
+  int signed expected_motion_y;
+  bit [7:0] expected_best_dist;
+  bit expected_motion_valid;
+
+  logic [7:0] actual_best_dist;
+  logic [3:0] actual_motion_x_raw;
+  logic [3:0] actual_motion_y_raw;
+  int signed actual_motion_x;
+  int signed actual_motion_y;
+
+  constraint legal_target_c {
+    target_top_row  inside {[0:15]};
+    target_left_col inside {[0:15]};
+  }
+
+  constraint useful_case_c {
+    kind dist {
+      TEST_PERTURBED := 4,
+      TEST_PERFECT   := 1
+    };
+    perturb_count inside {[1:12]};
+  }
+
+  function new(int unsigned id = 0);
+    this.id = id;
+  endfunction
+
+  function string kind_name();
+    case (kind)
+      TEST_PERFECT:   return "perfect";
+      TEST_PERTURBED: return "perturbed";
+      default:        return "unknown";
+    endcase
+  endfunction
+
+  function void post_randomize();
+    build_memories();
+  endfunction
+
+  function void build_memories();
+    int tries;
+    bit done;
+
+    tries = 0;
+    done = 0;
+
+    while (!done && tries < 20) begin
+      fill_search_memory();
+      copy_target_to_reference();
+
+      if (kind == TEST_PERTURBED) begin
+        perturb_reference();
+      end
+
+      compute_expected();
+
+      done = (kind == TEST_PERFECT && expected_best_dist == 8'd0) ||
+             (kind == TEST_PERTURBED && expected_best_dist != 8'd0 &&
+                                      expected_best_dist != 8'hff);
+      tries++;
+    end
+  endfunction
+
+  function void fill_search_memory();
+    int i;
+
+    for (i = 0; i < 1024; i++) begin
+      search_mem[i] = $urandom_range(0, 255);
+    end
+  endfunction
+
+  function void copy_target_to_reference();
+    int row, col;
+    int s_idx, r_idx;
+
+    for (row = 0; row < 16; row++) begin
+      for (col = 0; col < 16; col++) begin
+        s_idx = (target_top_row + row) * 32 + (target_left_col + col);
+        r_idx = row * 16 + col;
+        ref_mem[r_idx] = search_mem[s_idx];
+      end
+    end
+  endfunction
+
+  function void perturb_reference();
+    int k;
+    int idx;
+    int attempts;
+    int max_delta;
+    byte unsigned delta;
+
+    for (k = 0; k < perturb_count; k++) begin
+      attempts = 0;
+
+      do begin
+        idx = $urandom_range(0, 255);
+        attempts++;
+      end
+      while (ref_mem[idx] > 8'd243 && attempts < 64);
+
+      max_delta = 255 - ref_mem[idx];
+      if (max_delta > 12) begin
+        max_delta = 12;
+      end
+
+      if (max_delta >= 1) begin
+        delta = $urandom_range(1, max_delta);
+        ref_mem[idx] = ref_mem[idx] + delta;
+      end
+      else begin
+        delta = $urandom_range(1, 12);
+        ref_mem[idx] = ref_mem[idx] - delta;
+      end
+    end
+  endfunction
+
+  function int unsigned sad_for_candidate(int unsigned top_row,
+                                          int unsigned left_col);
+    int row, col;
+    int s_idx, r_idx;
+    int diff;
+    int unsigned acc;
+
+    acc = 0;
+
+    for (row = 0; row < 16; row++) begin
+      for (col = 0; col < 16; col++) begin
+        s_idx = (top_row + row) * 32 + (left_col + col);
+        r_idx = row * 16 + col;
+
+        if (ref_mem[r_idx] > search_mem[s_idx]) begin
+          diff = ref_mem[r_idx] - search_mem[s_idx];
+        end
+        else begin
+          diff = search_mem[s_idx] - ref_mem[r_idx];
+        end
+
+        if ((acc + diff) >= 255) begin
+          acc = 255;
+        end
+        else begin
+          acc = acc + diff;
+        end
+      end
+    end
+
+    return acc;
+  endfunction
+
+  function void compute_expected();
+    int unsigned row, col;
+    int unsigned dist_val;
+    int unsigned best;
+
+    best = 255;
+    expected_motion_valid = 0;
+    expected_motion_x = 0;
+    expected_motion_y = 0;
+
+    for (row = 0; row < 16; row++) begin
+      for (col = 0; col < 16; col++) begin
+        dist_val = sad_for_candidate(row, col);
+
+        if (dist_val < best) begin
+          best = dist_val;
+          expected_motion_x = int'(col) - 8;
+          expected_motion_y = int'(row) - 8;
+          expected_motion_valid = (dist_val != 255);
+        end
+      end
+    end
+
+    expected_best_dist = best[7:0];
+  endfunction
+
+endclass
+
+
+class motion_generator;
+
+  mailbox #(motion_transaction) gen_to_drv;
+  int unsigned num_random_tests;
+  int unsigned sent_count;
+
+  function new(mailbox #(motion_transaction) gen_to_drv,
+               int unsigned num_random_tests = 64);
+    this.gen_to_drv = gen_to_drv;
+    this.num_random_tests = num_random_tests;
+    this.sent_count = 0;
+  endfunction
+
+  task run();
+    send_directed(TEST_PERFECT,   0,  0);
+    send_directed(TEST_PERTURBED, 0,  0);
+    send_directed(TEST_PERTURBED, 0,  15);
+    send_directed(TEST_PERTURBED, 15, 0);
+    send_directed(TEST_PERTURBED, 15, 15);
+    send_directed(TEST_PERTURBED, 8,  8);
+    send_directed(TEST_PERTURBED, 8,  0);
+    send_directed(TEST_PERTURBED, 0,  8);
+    send_directed(TEST_PERTURBED, 15, 8);
+    send_directed(TEST_PERTURBED, 8,  15);
+    send_directed(TEST_PERTURBED, 4,  4);
+    send_directed(TEST_PERTURBED, 4,  12);
+    send_directed(TEST_PERTURBED, 12, 4);
+    send_directed(TEST_PERTURBED, 12, 12);
+    send_random();
+  endtask
+
+  task send_directed(test_kind_e kind,
+                     int unsigned top_row,
+                     int unsigned left_col);
+    motion_transaction tr;
+
+    tr = new(sent_count);
+    tr.kind = kind;
+    tr.target_top_row = top_row;
+    tr.target_left_col = left_col;
+    tr.perturb_count = 4;
+    tr.build_memories();
+
+    gen_to_drv.put(tr);
+    sent_count++;
+  endtask
+
+  task send_random();
+    motion_transaction tr;
+    int unsigned i;
+
+    for (i = 0; i < num_random_tests; i++) begin
+      tr = new(sent_count);
+
+      if (!tr.randomize()) begin
+        $display("FATAL: transaction randomization failed for id=%0d", sent_count);
+        $finish;
+      end
+
+      gen_to_drv.put(tr);
+      sent_count++;
+    end
+  endtask
+
+endclass
+
+
+class motion_driver;
+
+  virtual top_if vif;
+  mailbox #(motion_transaction) gen_to_drv;
+  mailbox #(motion_transaction) drv_to_mon;
+  int unsigned num_tests;
+
+  function new(virtual top_if vif,
+               mailbox #(motion_transaction) gen_to_drv,
+               mailbox #(motion_transaction) drv_to_mon,
+               int unsigned num_tests);
+    this.vif = vif;
+    this.gen_to_drv = gen_to_drv;
+    this.drv_to_mon = drv_to_mon;
+    this.num_tests = num_tests;
+  endfunction
+
+  task run();
+    motion_transaction tr;
+    int unsigned i;
+
+    vif.start = 1'b0;
+    repeat (2) @(posedge vif.clock);
+
+    for (i = 0; i < num_tests; i++) begin
+      gen_to_drv.get(tr);
+      load_memories(tr);
+
+      $display("");
+      $display("TEST %0d: kind=%s target_top=%0d target_left=%0d expected_dist=%0d expected_motion=(%0d,%0d)",
+               tr.id, tr.kind_name(), tr.target_top_row, tr.target_left_col,
+               tr.expected_best_dist, tr.expected_motion_x, tr.expected_motion_y);
+
+      drv_to_mon.put(tr);
+      start_dut();
+      wait_for_done();
+      stop_dut();
+    end
+  endtask
+
+  task load_memories(motion_transaction tr);
+    int i;
+
+    for (i = 0; i < 256; i++) begin
+      vif.Rmem[i] = tr.ref_mem[i];
+    end
+
+    for (i = 0; i < 1024; i++) begin
+      vif.Smem[i] = tr.search_mem[i];
+    end
+  endtask
+
+  task start_dut();
+    @(posedge vif.clock);
+    #1 vif.start = 1'b1;
+  endtask
+
+  task wait_for_done();
+    int cycles;
+
+    cycles = 0;
+    while (vif.completed !== 1'b1 && cycles < 5000) begin
+      @(posedge vif.clock);
+      #1;
+      cycles++;
+    end
+
+    if (cycles >= 5000) begin
+      $display("FATAL: timeout waiting for completed");
+      $finish;
+    end
+  endtask
+
+  task stop_dut();
+    #1 vif.start = 1'b0;
+    repeat (2) @(posedge vif.clock);
+  endtask
+
+endclass
+
+
+class motion_monitor;
+
+  virtual top_if vif;
+  mailbox #(motion_transaction) drv_to_mon;
+  mailbox #(motion_transaction) mon_to_scb;
+  int unsigned num_tests;
+
+  function new(virtual top_if vif,
+               mailbox #(motion_transaction) drv_to_mon,
+               mailbox #(motion_transaction) mon_to_scb,
+               int unsigned num_tests);
+    this.vif = vif;
+    this.drv_to_mon = drv_to_mon;
+    this.mon_to_scb = mon_to_scb;
+    this.num_tests = num_tests;
+  endfunction
+
+  task run();
+    motion_transaction tr;
+    int unsigned i;
+
+    for (i = 0; i < num_tests; i++) begin
+      drv_to_mon.get(tr);
+
+      while (vif.completed !== 1'b1) begin
+        @(posedge vif.clock);
+        #1;
+      end
+
+      tr.actual_best_dist = vif.BestDist;
+      tr.actual_motion_x_raw = vif.motionX;
+      tr.actual_motion_y_raw = vif.motionY;
+      tr.actual_motion_x = decode_motion(vif.motionX);
+      tr.actual_motion_y = decode_motion(vif.motionY);
+
+      mon_to_scb.put(tr);
+    end
+  endtask
+
+  function int signed decode_motion(logic [3:0] value);
+    if (value >= 4'd8) begin
+      return int'(value) - 16;
+    end
+
+    return int'(value);
+  endfunction
+
+endclass
+
+
+class motion_coverage;
+
+  test_kind_e sampled_kind;
+  int signed sampled_target_x;
+  int signed sampled_target_y;
+  int signed sampled_expected_x;
+  int signed sampled_expected_y;
+  int unsigned sampled_dist;
+  bit sampled_motion_valid;
+
+  covergroup motion_cg;
+    option.per_instance = 1;
+
+    kind_cp: coverpoint sampled_kind {
+      bins perfect   = {TEST_PERFECT};
+      bins perturbed = {TEST_PERTURBED};
+    }
+
+    target_x_cp: coverpoint sampled_target_x {
+      bins left_edge  = {-8};
+      bins left_mid   = {[-7:-1]};
+      bins center     = {0};
+      bins right_mid  = {[1:6]};
+      bins right_edge = {7};
+    }
+
+    target_y_cp: coverpoint sampled_target_y {
+      bins top_edge    = {-8};
+      bins top_mid     = {[-7:-1]};
+      bins center      = {0};
+      bins bottom_mid  = {[1:6]};
+      bins bottom_edge = {7};
+    }
+
+    expected_x_cp: coverpoint sampled_expected_x iff (sampled_motion_valid) {
+      bins left_edge  = {-8};
+      bins left_mid   = {[-7:-1]};
+      bins center     = {0};
+      bins right_mid  = {[1:6]};
+      bins right_edge = {7};
+    }
+
+    expected_y_cp: coverpoint sampled_expected_y iff (sampled_motion_valid) {
+      bins top_edge    = {-8};
+      bins top_mid     = {[-7:-1]};
+      bins center      = {0};
+      bins bottom_mid  = {[1:6]};
+      bins bottom_edge = {7};
+    }
+
+    dist_cp: coverpoint sampled_dist {
+      bins zero    = {0};
+      bins nonzero = {[1:254]};
+    }
+  endgroup
+
+  function new();
+    motion_cg = new();
+  endfunction
+
+  function void sample(motion_transaction tr);
+    sampled_kind = tr.kind;
+    sampled_target_x = int'(tr.target_left_col) - 8;
+    sampled_target_y = int'(tr.target_top_row) - 8;
+    sampled_expected_x = tr.expected_motion_x;
+    sampled_expected_y = tr.expected_motion_y;
+    sampled_dist = tr.expected_best_dist;
+    sampled_motion_valid = tr.expected_motion_valid;
+    motion_cg.sample();
+  endfunction
+
+  function real get_coverage();
+    return motion_cg.get_coverage();
+  endfunction
+
+endclass
+
+
+class motion_scoreboard;
+
+  mailbox #(motion_transaction) mon_to_scb;
+  motion_coverage cov;
+  int unsigned num_tests;
+  int unsigned pass_count;
+  int unsigned fail_count;
+
+  function new(mailbox #(motion_transaction) mon_to_scb,
+               int unsigned num_tests);
+    this.mon_to_scb = mon_to_scb;
+    this.num_tests = num_tests;
+    this.cov = new();
+    this.pass_count = 0;
+    this.fail_count = 0;
+  endfunction
+
+  task run();
+    motion_transaction tr;
+    int unsigned i;
+
+    for (i = 0; i < num_tests; i++) begin
+      mon_to_scb.get(tr);
+      check(tr);
+      cov.sample(tr);
+    end
+
+    $display("");
+    $display("===== SCOREBOARD SUMMARY =====");
+    $display("PASS count           = %0d", pass_count);
+    $display("FAIL count           = %0d", fail_count);
+    $display("Functional coverage  = %0.2f%%", cov.get_coverage());
+    $display("==============================");
+
+    if (fail_count != 0) begin
+      $display("TESTBENCH RESULT: FAIL");
+      $finish;
+    end
+
+    $display("TESTBENCH RESULT: PASS");
+  endtask
+
+  task check(motion_transaction tr);
+    bit pass;
+
+    pass = 1'b1;
+
+    if (tr.actual_best_dist !== tr.expected_best_dist) begin
+      pass = 1'b0;
+      $display("FAIL id=%0d: BestDist actual=%0d expected=%0d",
+               tr.id, tr.actual_best_dist, tr.expected_best_dist);
+    end
+
+    if (tr.expected_motion_valid) begin
+      if (tr.actual_motion_x != tr.expected_motion_x ||
+          tr.actual_motion_y != tr.expected_motion_y) begin
+        pass = 1'b0;
+        $display("FAIL id=%0d: motion actual=(%0d,%0d) expected=(%0d,%0d)",
+                 tr.id, tr.actual_motion_x, tr.actual_motion_y,
+                 tr.expected_motion_x, tr.expected_motion_y);
+      end
+    end
+    else begin
+      $display("INFO id=%0d: expected distortion saturated; motion vector is not checked",
+               tr.id);
+    end
+
+    if (pass) begin
+      pass_count++;
+      $display("PASS id=%0d: BestDist=%0d motion=(%0d,%0d)",
+               tr.id, tr.actual_best_dist, tr.actual_motion_x, tr.actual_motion_y);
+    end
+    else begin
+      fail_count++;
+    end
+  endtask
+
+endclass
+
+
+class motion_environment;
+
+  virtual top_if vif;
+  mailbox #(motion_transaction) gen_to_drv;
+  mailbox #(motion_transaction) drv_to_mon;
+  mailbox #(motion_transaction) mon_to_scb;
+
+  motion_generator gen;
+  motion_driver drv;
+  motion_monitor mon;
+  motion_scoreboard scb;
+
+  int unsigned num_random_tests;
+  int unsigned num_directed_tests;
+  int unsigned num_tests;
+
+  function new(virtual top_if vif);
+    this.vif = vif;
+  endfunction
+
+  task build();
+    num_random_tests = 64;
+    num_directed_tests = 14;
+
+    if ($value$plusargs("NUM_RANDOM_TESTS=%d", num_random_tests)) begin
+      $display("Using NUM_RANDOM_TESTS=%0d", num_random_tests);
+    end
+
+    num_tests = num_random_tests + num_directed_tests;
+
+    gen_to_drv = new();
+    drv_to_mon = new();
+    mon_to_scb = new();
+
+    gen = new(gen_to_drv, num_random_tests);
+    drv = new(vif, gen_to_drv, drv_to_mon, num_tests);
+    mon = new(vif, drv_to_mon, mon_to_scb, num_tests);
+    scb = new(mon_to_scb, num_tests);
+  endtask
+
+  task run();
+    fork
+      gen.run();
+      drv.run();
+      mon.run();
+      scb.run();
+    join
+  endtask
+
+endclass
 
 
 module top_testbench;
 
   top_if intf();
+  motion_environment env;
 
-  integer i;
-  integer signed x, y;   // signed versions for motion output
-  integer test_mode;
-
-  integer rand_top_row;
-  integer rand_left_col;
-
-  // DUT hookup
   top dut (
     .clock     (intf.clock),
     .start     (intf.start),
@@ -43,122 +648,9 @@ module top_testbench;
     .completed (intf.completed)
   );
 
-  // Reference memory (16x16 block)
-  ROM_R memR_u (
-    .clock    (intf.clock),
-    .AddressR (intf.AddressR),
-    .R        (intf.R)
-  );
-
-  // Search memory (32x32 block)
-  ROM_S memS_u (
-    .clock    (intf.clock),
-    .AddressS1(intf.AddressS1),
-    .AddressS2(intf.AddressS2),
-    .S1       (intf.S1),
-    .S2       (intf.S2)
-  );
-
-  // 50MHz clock
   always #10 intf.clock = ~intf.clock;
 
-  // Copy a 16x16 window from search memory into reference memory
-  task make_ref_from_search;
-    input integer top_row;   // must be 0..16
-    input integer left_col;  // must be 0..16
-    integer r, c;
-    integer s_idx, r_idx;
-    begin
-      // basic bounds check so we don't walk off memory
-      if (top_row < 0 || top_row > 16 || left_col < 0 || left_col > 16) begin
-        $display("ERROR: make_ref_from_search out of range. top_row=%0d left_col=%0d",
-                 top_row, left_col);
-        $finish;
-      end
-
-      // map 16x16 window from 32x32 search into 16x16 reference
-      for (r = 0; r < 16; r = r + 1) begin
-        for (c = 0; c < 16; c = c + 1) begin
-          s_idx = (top_row + r) * 32 + (left_col + c);
-          r_idx = r * 16 + c;
-          memR_u.Rmem[r_idx] = memS_u.Smem[s_idx];
-        end
-      end
-
-      $display("Reference copied from Search block: top_row=%0d left_col=%0d",
-               top_row, left_col);
-    end
-  endtask
-
-  // Decide what kind of test we want to run
-  task apply_test_mode;
-    begin
-      // pick a random valid starting point inside 32x32
-      rand_top_row  = $urandom % 17; // random number from 0 to 16
-      rand_left_col = $urandom % 17;
-
-      case (test_mode)
-        0: begin
-          // exact match case: reference is copied directly from search
-          $display("Running PERFECT MATCH test from random search memory block.");
-          make_ref_from_search(rand_top_row, rand_left_col);
-        end
-
-        1: begin
-          // mostly match, but tweak a few pixels
-          $display("Running PARTIAL / PERTURBED MATCH test from random search memory block.");
-          make_ref_from_search(rand_top_row, rand_left_col);
-
-          memR_u.Rmem[1]   = memR_u.Rmem[1]   + 8'd3;
-          memR_u.Rmem[20]  = memR_u.Rmem[20]  + 8'd4;
-          memR_u.Rmem[55]  = memR_u.Rmem[55]  + 8'd5;
-          memR_u.Rmem[100] = memR_u.Rmem[100] + 8'd6;
-        end
-
-        2: begin
-          // completely different reference (should not match anything)
-          $display("Running NO-INTENDED-MATCH test.");
-          for (i = 0; i < 256; i = i + 1) begin
-            memR_u.Rmem[i] = 8'hFF;
-          end
-        end
-
-        default: begin
-          // fallback if test_mode is garbage
-          $display("Unknown test_mode. Using random perfect match.");
-          make_ref_from_search(rand_top_row, rand_left_col);
-        end
-      endcase
-    end
-  endtask
-
-  // Dump both memories so we can visually inspect them if needed
-  task print_memories;
-    integer row, col;
-    begin
-      $display("");
-      $display("Reference Memory content:");
-      for (row = 0; row < 256; row = row + 16) begin
-        for (col = 0; col < 16; col = col + 1) begin
-          $write("%02h ", memR_u.Rmem[row + col]);
-        end
-        $write("\n");
-      end
-
-      $display("");
-      $display("Search Memory content:");
-      for (row = 0; row < 1024; row = row + 32) begin
-        for (col = 0; col < 32; col = col + 1) begin
-          $write("%02h ", memS_u.Smem[row + col]);
-        end
-        $write("\n");
-      end
-      $display("");
-    end
-  endtask
-
   initial begin
-    // waveform dump for debugging
     $dumpfile("dump.vcd");
     $dumpvars(0, intf.clock);
     $dumpvars(0, intf.start);
@@ -174,94 +666,14 @@ module top_testbench;
     $dumpvars(0, intf.S2);
     $dumpvars(0, dut.ctl_u.count);
 
-    intf.clock = 0;
-    intf.start = 0;
+    intf.clock = 1'b0;
+    intf.start = 1'b0;
 
-    // pick which scenario to run
-    //test_mode = 0;
-    //test_mode = 1;
-    test_mode = 2;
+    env = new(intf);
+    env.build();
+    env.run();
 
-    // load initial memory contents from files
-    $readmemh("search.txt", memS_u.Smem);
-    $readmemh("ref.txt", memR_u.Rmem);
-
-    apply_test_mode();
-
-    print_memories();
-
-    // dump out what we actually used
-    $writememh("search_dump.txt", memS_u.Smem);
-    $writememh("ref_randomized.txt", memR_u.Rmem);
-
-    $display("Starting simulation...");
-
-    // kick off DUT
-    @(posedge intf.clock);
-    #1 intf.start = 1'b1;
-
-    // main simulation loop
-    for (i = 0; i < 5000; i = i + 1) begin
-      @(posedge intf.clock);
-      #1;
-
-      // print progress every 100 cycles
-      if ((i % 100) == 0) begin
-        $display("cycle=%0d BestDist=%h motionX=%h motionY=%h count=%0d completed=%b",
-                 i, intf.BestDist, intf.motionX, intf.motionY, dut.ctl_u.count, intf.completed);
-      end
-
-      // stop when DUT says it's done
-      if (intf.completed) begin
-        $display("Completed at cycle %0d", i);
-        intf.start = 1'b0;
-
-        // convert 4-bit unsigned to signed (-8..7)
-        if (intf.motionX >= 8) x = intf.motionX - 16;
-        else                   x = intf.motionX;
-
-        if (intf.motionY >= 8) y = intf.motionY - 16;
-        else                   y = intf.motionY;
-
-        $display("");
-        $display("===== FINAL RESULT =====");
-        $display("BestDist = %0d (0x%0h)", intf.BestDist, intf.BestDist);
-        $display("motionX  = %0d", x);
-        $display("motionY  = %0d", y);
-        $display("completed = %b", intf.completed);
-        $display("========================");
-
-        // basic pass/fail checks per test type
-        case (test_mode)
-          0: begin
-            if (intf.BestDist == 8'h00)
-              $display("PASS: perfect-match style test produced zero distortion.");
-            else
-              $display("FAIL: expected zero distortion for perfect-match file test.");
-          end
-
-          1: begin
-            if (intf.BestDist != 8'h00 && intf.BestDist != 8'hFF)
-              $display("PASS: partial-match style test produced non-zero distortion.");
-            else
-              $display("FAIL: partial-match test did not produce a useful non-zero BestDist.");
-          end
-
-          2: begin
-            if (intf.BestDist != 8'h00)
-              $display("PASS: no-intended-match test produced non-zero distortion.");
-            else
-              $display("FAIL: no-intended-match test unexpectedly produced zero distortion.");
-          end
-        endcase
-
-        #20;
-        $finish;
-      end
-    end
-
-    // if we get here, DUT never finished
-    $display("Timeout: completed never asserted.");
+    #20;
     $finish;
   end
 
